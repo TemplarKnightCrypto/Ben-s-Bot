@@ -1,5 +1,5 @@
 # ===============================================
-# Scout Tower - Enhanced ETH Alert Bot (v3.3.11, Zones)
+# Scout Tower - Enhanced ETH Alert Bot (v3.3.12, Zones)
 # - Adds commands: !checksheets, !rehydrate, !version
 # - Keeps entry ZONES, percent SL/TP, no position-size by default
 # ===============================================
@@ -359,13 +359,51 @@ class TradeManager:
         self.active: Dict[str, TradeData] = {}
         self.cooldown_until: Dict[str, float] = {}
         self.tp1_hits=set()
+
     async def rehydrate(self):
-        rows = await self.sheets.rehydrate_open_trades()
-        for t in rows: self.active[t.id]=t
-        log.info(f"Rehydrated {len(rows)} open alerts.")
-        return len(rows)
-    def on_cooldown(self, side:str)->bool: return time.time()<self.cooldown_until.get(side,0)
-    def set_cooldown(self, side:str): self.cooldown_until[side]=time.time()+self.cfg.alert_cooldown_minutes*60
+        try:
+            rows: List[TradeData] = []
+            if hasattr(self.sheets, "rehydrate_open_trades"):
+                rows = await self.sheets.rehydrate_open_trades()
+            else:
+                data = await self.sheets._get({"action": "open"})
+                raw = (data.get("trades", []) or data.get("rows", []) or data.get("data", []) or [])
+                for r in raw:
+                    k = { (str(k) if k is not None else '').strip().lower(): v for k, v in r.items() }
+                    if str(k.get("status","")).strip().upper() != "OPEN":
+                        continue
+                    td = TradeData(
+                        id=str(k.get("trade id") or k.get("trade_id") or ""),
+                        pair=str(k.get("asset") or "ETH/USDT"),
+                        side=str(k.get("direction") or "LONG").capitalize(),
+                        entry_price=float(k.get("entry price") or k.get("entry_price") or 0) if (k.get("entry price") or k.get("entry_price")) not in (None,"") else 0.0,
+                        stop_loss=float(k.get("stop loss") or k.get("stop_loss") or 0) if (k.get("stop loss") or k.get("stop_loss")) not in (None,"") else 0.0,
+                        take_profit_1=float(k.get("take profit 1") or k.get("take_profit_1") or 0) if (k.get("take profit 1") or k.get("take_profit_1")) not in (None,"") else 0.0,
+                        take_profit_2=float(k.get("take profit 2") or k.get("take_profit_2") or 0) if (k.get("take profit 2") or k.get("take_profit_2")) not in (None,"") else 0.0,
+                        status="OPEN",
+                        timestamp=str(k.get("timestamp") or utc_now().isoformat()),
+                    )
+                    el = k.get("entry low") or k.get("entry_low")
+                    eh = k.get("entry high") or k.get("entry_high")
+                    if el not in (None, ""):
+                        try: td.entry_low = float(str(el).replace(',',''))
+                        except: pass
+                    if eh not in (None, ""):
+                        try: td.entry_high = float(str(eh).replace(',',''))
+                        except: pass
+                    rows.append(td)
+            for t in rows:
+                self.active[t.id] = t
+            log.info(f"Rehydrated {len(rows)} open alerts from Sheets.")
+            return len(rows)
+        except Exception as e:
+            log.warning(f"rehydrate error: {e}")
+            return 0
+
+    def on_cooldown(self, side:str)->bool:
+        return time.time() < self.cooldown_until.get(side, 0)
+    def set_cooldown(self, side:str):
+        self.cooldown_until[side] = time.time() + self.cfg.alert_cooldown_minutes*60
     def calculate_pnl(self, t: TradeData, price: float) -> float:
         d=1 if t.side.upper()=="LONG" else -1; return d*(price-t.entry_price)/t.entry_price*100.0
     async def open_trade(self, t: TradeData):
@@ -723,3 +761,65 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+@bot.command(name="sheetping")
+async def sheetping(ctx):
+    """Round-trip Sheets health check: POST + GET"""
+    try:
+        now_ts = int(time.time())
+        dummy_id = f"PING-{now_ts}"
+        t = TradeData(
+            id=dummy_id, pair="ETH/USDT", side="TEST",
+            entry_price=1234.56, stop_loss=1230.00,
+            take_profit_1=1240.00, take_profit_2=1245.00,
+            status="OPEN", timestamp=utc_now().isoformat()
+        )
+        t.entry_low = 1233.00
+        t.entry_high = 1236.00
+        res = await sheets.write_entry_with_retry(t)
+        try:
+            rows = []
+            if hasattr(sheets, "rehydrate_open_trades"):
+                rows = await sheets.rehydrate_open_trades()
+            else:
+                data = await sheets._get({"action":"open"})
+                rows = data.get("trades", []) or data.get("rows", []) or data.get("data", []) or []
+            found = False
+            for r in rows:
+                if isinstance(r, TradeData):
+                    if r.id == dummy_id:
+                        found=True
+                        break
+                elif isinstance(r, dict):
+                    keys = { (str(k) if k is not None else '').strip().lower(): v for k, v in r.items() }
+                    rid = str(keys.get("trade id") or keys.get("trade_id") or "")
+                    if rid == dummy_id:
+                        found=True
+                        break
+            await ctx.reply(f"✅ Sheets ping OK — posted `{dummy_id}`; found={found}. HTTP={res.get('http_status','?')} payload={res}")
+        except Exception as inner:
+            await ctx.reply(f"⚠️ Posted `{dummy_id}` but GET failed: `{inner}` (POST payload={res})")
+    except Exception as e:
+        await ctx.reply(f"❌ Sheets ping failed: `{e}`")
+
+
+@bot.command(name="sheetfix")
+async def sheetfix(ctx):
+    """Rewrite header row via Apps Script ensureHeaders (no row append)."""
+    try:
+        payload = {"action": "update", "id": "__sheetfix__"}
+        if sheets.token:
+            payload["token"] = sheets.token
+        _ = await sheets._post(payload)
+        data = await sheets._get({"action":"open"})
+        trades = data.get("trades", []) or data.get("rows", []) or data.get("data", []) or []
+        headers = list(trades[0].keys()) if trades else []
+        expected = ['Trade ID','Asset','Direction','Entry Price','Entry Low','Entry High','Stop Loss','Take Profit 1','Take Profit 2','Status','Exit Price','Exit Reason','PnL %','Timestamp','Level Name','Level Price','Confidence','Knight','Original Score']
+        ok = headers[:len(expected)] == expected[:len(headers)] if headers else False
+        await ctx.reply("✅ Header check complete.\n"
+                        f"**Expected:** {expected}\n"
+                        f"**Current:**  {headers or '— (no rows returned; headers likely set but sheet is empty)'}\n"
+                        f"Result: {'OK' if ok else 'Mismatch — headers were updated, but confirm in Sheet.'}")
+    except Exception as e:
+        await ctx.reply(f"❌ sheetfix failed: `{e}`")
