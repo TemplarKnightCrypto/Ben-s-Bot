@@ -16,7 +16,7 @@ from discord.ext import tasks, commands
 from flask import Flask, jsonify
 import threading
 
-VERSION = "3.3.1"
+VERSION = "3.3.4"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -228,17 +228,65 @@ class TradeData:
     market_context: Optional[str] = None
 
 class GoogleSheetsIntegration:
+
+    def _normalize_keys(self, row: Dict[str, Any]) -> Dict[str, Any]:
+        """Map pretty Sheet headers to internal snake_case keys."""
+        mapping = {
+            "trade id": "trade_id",
+            "asset": "asset",
+            "direction": "side",
+            "entry price": "entry_price",
+            "stop loss": "stop_loss",
+            "take profit 1": "take_profit_1",
+            "take profit 2": "take_profit_2",
+            "status": "status",
+            "exit price": "exit_price",
+            "exit reason": "exit_reason",
+            "pnl %": "pnl_pct",
+            "timestamp": "timestamp",
+            "level name": "level_name",
+            "level price": "level_price",
+            "confidence": "confidence",
+            "knight": "knight",
+            "original score": "score",
+            # fallbacks seen in some payloads
+            "pair": "asset",
+            "direction/side": "side",
+        }
+        out = {}
+        for k, v in row.items():
+            kk = (k or "").strip().lower()
+            out[mapping.get(kk, kk)] = v
+        return out
+
+    def _to_float(self, v, default=0.0) -> float:
+        try:
+            if v in (None, ""): return default
+            if isinstance(v, (int, float)): return float(v)
+            return float(str(v).replace(',', '').strip())
+        except Exception:
+            return default
     def __init__(self, url: str, token: Optional[str] = None):
         self.url=url; self.token=token
     async def _post(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         session = await session_mgr.get_session()
         headers={"Content-Type":"application/json"}
-        if self.token: headers["x-app-secret"]=self.token
+        url = self.url
+        if self.token:
+            headers["x-app-secret"]=self.token
+            joiner = "&" if ("?" in url) else "?"
+            url = f"{url}{joiner}key={self.token}"
         try:
-            async with session.post(self.url, data=json.dumps(payload), headers=headers) as r:
+            async with session.post(url, data=json.dumps(payload), headers=headers) as r:
                 txt = await r.text()
-                try: return json.loads(txt) if txt else {"status":"error","message":"empty"}
-                except Exception: return {"status":"error","message":"non-json","raw":txt[:200]}
+                try:
+                    data = json.loads(txt) if txt else {}
+                except Exception:
+                    data = {"status":"error","message":"non-json","raw":txt[:200]}
+                # include http status for diagnostics
+                if isinstance(data, dict) and "http_status" not in data:
+                    data["http_status"] = r.status
+                return data if data else {"status":"error","message":"empty","http_status": r.status}
         except Exception as e:
             return {"status":"error","message":str(e)}
     async def _get(self, params: Dict[str, Any]) -> Dict[str, Any]:
@@ -274,20 +322,33 @@ class GoogleSheetsIntegration:
         return await self._post({"action":"update","id":trade_id,"exit_price":exit_price,"exit_reason":exit_reason,"pnl_pct":pnl_pct,"status":"CLOSED"})
     async def rehydrate_open_trades(self) -> List[TradeData]:
         data = await self._get({"action":"open"})
-        rows = data.get("rows", []); out=[]
+        rows = data.get("rows", []) or data.get("data", []) or []
+        out: List[TradeData] = []
         for r in rows:
             try:
+                norm = self._normalize_keys(r)
+                # Only OPEN rows
+                if str(norm.get("status","")).strip().upper() != "OPEN":
+                    continue
                 out.append(TradeData(
-                    id=str(r.get("Trade ID","")), pair=r.get("Asset","ETH/USDT"), side=r.get("Direction","LONG"),
-                    entry_price=float(r.get("Entry Price",0)), stop_loss=float(r.get("Stop Loss",0)),
-                    take_profit_1=float(r.get("Take Profit 1",0)), take_profit_2=float(r.get("Take Profit 2",0)),
-                    status=r.get("Status","OPEN"), timestamp=r.get("Timestamp", utc_now().isoformat()),
-                    level_name=r.get("Level Name"), level_price=float(r.get("Level Price")) if r.get("Level Price") else None,
-                    confidence=r.get("Confidence"), knight=r.get("Knight") or "Sir Leonis",
-                    score=float(r.get("Original Score")) if r.get("Original Score") else None,
-                    market_context=r.get("Market Context")
+                    id=str(norm.get("trade_id","")) or str(norm.get("id","")),
+                    pair=str(norm.get("asset","ETH/USDT")),
+                    side=str(norm.get("side","LONG")).upper().capitalize(),
+                    entry_price=self._to_float(norm.get("entry_price"), 0),
+                    stop_loss=self._to_float(norm.get("stop_loss"), 0),
+                    take_profit_1=self._to_float(norm.get("take_profit_1"), 0),
+                    take_profit_2=self._to_float(norm.get("take_profit_2"), 0),
+                    status=str(norm.get("status","OPEN")),
+                    timestamp=str(norm.get("timestamp", utc_now().isoformat())),
+                    level_name=norm.get("level_name"),
+                    level_price=self._to_float(norm.get("level_price")) if norm.get("level_price") not in (None, "") else None,
+                    confidence=str(norm.get("confidence","")) if norm.get("confidence") not in (None, "") else None,
+                    knight=str(norm.get("knight") or "Sir Leonis"),
+                    score=self._to_float(norm.get("score")) if norm.get("score") not in (None, "") else None,
+                    market_context=norm.get("market_context")
                 ))
-            except Exception:
+            except Exception as e:
+                # keep going even if a row is malformed
                 continue
         return out
 
@@ -547,7 +608,7 @@ async def testsheets(ctx):
             confidence="Connection Test", score=0.0, level_name="Testing Google Sheets Integration"
         )
         res = await sheets.write_entry(test_trade)
-        await ctx.reply(f"Sheets POST result:\n```{res}```")
+        await ctx.reply(f"Sheets POST result (status={res.get('http_status','?')}):\n```{res}```")
     except Exception as e:
         await ctx.reply(f"❌ Sheets test error:\n```{e}```")
 
