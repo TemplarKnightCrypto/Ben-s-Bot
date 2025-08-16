@@ -535,7 +535,7 @@ class DiscordIO:
         ch = self.client.get_channel(channel_id)
         return ch
 
-    async def safe_send(self, channel_id: int, **embed_kwargs):
+    async def safe_send(self, channel_id: int, embed_obj: 'discord.Embed' = None, **embed_kwargs):
         ch = self.channel(channel_id)
         if not ch:
             try:
