@@ -43,7 +43,6 @@ from dataclasses import dataclass, field, asdict
 from typing import Optional, Dict, Any, List, Tuple
 from datetime import datetime, timezone
 import pandas as pd
-import uuid
 import numpy as np
 
 import discord
@@ -313,35 +312,37 @@ class GoogleSheetsIntegration:
         return await self._post(session, payload)
 
     async def update_exit(self, session: aiohttp.ClientSession, trade_id: str, exit_price: float, exit_reason: str, pnl_pct: float) -> Dict[str, Any]:
-        payload = {"action":"update","id": trade_id,
+        payload = {
+            "action":"update",
+            "id": trade_id,
             "exit_price": exit_price,
             "exit_reason": exit_reason,
             "pnl_pct": pnl_pct,
             "status": "CLOSED"
-        , "token": self.token}
+        }
         return await self._post(session, payload)
 
     async def rehydrate_open_trades(self, session: aiohttp.ClientSession) -> List[TradeData]:
         data = await self._get(session, {"action":"open"})
-        rows = data.get("trades", [])
+        rows = data.get("rows", [])
         out: List[TradeData] = []
         for r in rows:
             try:
                 out.append(TradeData(
-                    id=str(r.get("Trade ID") or r.get("id") or ""),
-                    pair=r.get("Asset") or r.get("pair") or "ETH/USDT",
-                    side=r.get("Direction") or r.get("side") or "LONG",
-                    entry_price=float(r.get("Entry Price") or r.get("entry_price") or 0),
-                    stop_loss=float(r.get("Stop Loss") or r.get("stop_loss") or 0),
-                    take_profit_1=float(r.get("Take Profit 1") or r.get("take_profit_1") or 0),
-                    take_profit_2=float(r.get("Take Profit 2") or r.get("take_profit_2") or 0),
-                    status=r.get("Status") or r.get("status") or "OPEN",
-                    timestamp=r.get("Timestamp") or r.get("timestamp") or utc_now().isoformat(),
-                    level_name=r.get("Level Name") or r.get("level_name"),
-                    level_price=float(r.get("Level Price") or r.get("level_price")) if (r.get("Level Price") or r.get("level_price")) else None,
-                    confidence=r.get("Confidence") or r.get("confidence"),
-                    knight=(r.get("Knight") or r.get("knight") or "Sir Leonis"),
-                    score=float(r.get("Original Score") or r.get("score")) if (r.get("Original Score") or r.get("score")) else None
+                    id=str(r.get("Trade ID","")),
+                    pair=r.get("Asset","ETH/USDT"),
+                    side=r.get("Direction","LONG"),
+                    entry_price=float(r.get("Entry Price", 0)),
+                    stop_loss=float(r.get("Stop Loss", 0)),
+                    take_profit_1=float(r.get("Take Profit 1", 0)),
+                    take_profit_2=float(r.get("Take Profit 2", 0)),
+                    status=r.get("Status","OPEN"),
+                    timestamp=r.get("Timestamp", utc_now().isoformat()),
+                    level_name=r.get("Level Name"),
+                    level_price=float(r.get("Level Price")) if r.get("Level Price") else None,
+                    confidence=r.get("Confidence"),
+                    knight=r.get("Knight") or "Sir Leonis",
+                    score=float(r.get("Original Score")) if r.get("Original Score") else None
                 ))
             except Exception as e:
                 log.warning(f"rehydrate row parse error: {e}")
@@ -400,18 +401,7 @@ class TradeManager:
         # CSV log
         append_csv(ALERTS_CSV, {**asdict(t), "opened_at": utc_now().isoformat()})
         # Sheets
-        resp = await self.sheets.write_entry(self.session, t)
-        try:
-            ok = str(resp.get("status","")).lower()
-        except Exception:
-            ok = "error"
-        if ok not in ("ok","success","200","true","added","updated"):
-            log.error(f"Sheets write failed: {resp}")
-            try:
-                emb = build_error_embed(f"Sheets write failed for trade {t.id}: {resp}", self.cfg)
-                await dio.safe_send(self.cfg.errors_channel_id, embed_obj=emb)
-            except Exception as e:
-                log.error(f"Error reporting failure to errors channel: {e}")
+        await self.sheets.write_entry(self.session, t)
 
     async def close_trade(self, trade_id: str, exit_price: float, reason: str):
         t = self.active.get(trade_id)
@@ -545,7 +535,7 @@ class DiscordIO:
         ch = self.client.get_channel(channel_id)
         return ch
 
-    async def safe_send(self, channel_id: int, **embed_kwargs, embed_obj: 'discord.Embed' = None):
+    async def safe_send(self, channel_id: int, **embed_kwargs):
         ch = self.channel(channel_id)
         if not ch:
             try:
@@ -712,7 +702,9 @@ async def posttest(ctx):
         level_name="Test embed"
     )
     emb = build_trade_embed(t, CFG)
-    await dio.safe_send(CFG.signals_channel_id, embed_obj=emb)
+    await dio.safe_send(CFG.signals_channel_id,
+        title=emb.title, description=emb.description,
+        color=emb.color, timestamp=emb.timestamp)
     await ctx.reply(f"Posted a test embed to channel {CFG.signals_channel_id}. If you don't see it, check bot permissions.")
 
 @bot.command(name="mode")
@@ -737,6 +729,20 @@ async def show_mode(ctx):
         f"Current mode → Scan: {s['scan']}s | Min Score: {s['min_score']} | Cooldown: {s['cooldown']}m"
     )
 
+@bot.command(name="help", aliases=["commands"])
+async def help_command(ctx):
+    commands_text = (
+        "**Available Commands**\n"
+        "`!ping` - pong test\n"
+        "`!status` - show status embed (also posts daily)\n"
+        "`!posttest` - send a sample trade embed to signals channel\n"
+        "`!force` - force immediate scan and print reasoning\n"
+        "`!mode <testing|level1|level2|level3|t|l1|l2|l3>` - switch thresholds live\n"
+        "`!showmode` - display current thresholds\n"
+        "`!help` / `!commands` - show this message"
+    )
+    await ctx.send(commands_text)
+
 # -------------- On Ready -----------------
 @bot.event
 async def on_ready():
@@ -751,7 +757,7 @@ async def on_ready():
     # Startup notice
     try:
         emb = build_startup_embed(CFG, open_count=len(tm.active))
-        await dio.safe_send(CFG.startup_channel_id, embed_obj=emb)
+        await dio.safe_send(CFG.startup_channel_id, title=emb.title, description=emb.description, color=emb.color, timestamp=emb.timestamp)
     except Exception as e:
         log.warning(f"startup embed error: {e}")
 
@@ -776,7 +782,7 @@ async def scanner():
             return
 
         # Build trade
-        trade_id = f'ETH-{int(time.time())}-{uuid.uuid4().hex[:4]}'
+        trade_id = f"ETH-{int(time.time())}"
         t = TradeData(
             id=trade_id,
             pair="ETH/USDT",
@@ -794,21 +800,21 @@ async def scanner():
 
         # Send embed
         emb = build_trade_embed(t, CFG)
-        await dio.safe_send(CFG.signals_channel_id, embed_obj=emb)
+        await dio.safe_send(CFG.signals_channel_id, title=emb.title, description=emb.description, color=emb.color, timestamp=emb.timestamp)
         # Cooldown set
         tm.set_cooldown(sig.side.upper())
 
     except Exception as e:
         log.error(f"scanner error: {e}")
         emb = build_error_embed(f"Scanner error: {e}", CFG)
-        await dio.safe_send(CFG.errors_channel_id, embed_obj=emb)
+        await dio.safe_send(CFG.errors_channel_id, title=emb.title, description=emb.description, color=emb.color, timestamp=emb.timestamp)
 
 # -------------- Daily Summary -----------------
 @tasks.loop(hours=24)
 async def daily_summary():
     try:
         emb = build_status_embed(CFG, provider_ok=True, last_price=_last_price)
-        await dio.safe_send(CFG.status_channel_id, embed_obj=emb)
+        await dio.safe_send(CFG.status_channel_id, title=emb.title, description=emb.description, color=emb.color, timestamp=emb.timestamp)
     except Exception as e:
         log.error(f"daily_summary error: {e}")
 
