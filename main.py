@@ -1,23 +1,31 @@
 # ===============================================
-# Scout Tower - Enhanced ETH Alert Bot (v3.3.12, Zones)
-# - Adds commands: !checksheets, !rehydrate, !version
-# - Keeps entry ZONES, percent SL/TP, no position-size by default
+# Scout Tower - Enhanced ETH Alert Bot (v3.3.14 MERGED)
+# - Engine: Donchian breakout + EMA trend + RSI/VWAP/ATR filters
+# - Zones: Entry band, SL/TP from ATR + structure
+# - Providers: Binance primary, Kraken fallback
+# - Discord: commands (modes, stats, csv, active/close/result, sheets utils)
+# - Sheets: webhook write + rehydrate of open alerts
+# - CSV: alerts.csv / decisions.csv / fills.csv
+# - Flask: /health and /metrics
 # ===============================================
-import os, sys, json, math, csv, asyncio, aiohttp, logging, time, pathlib
+
+import os, sys, csv, json, math, time, asyncio, logging, random, threading, io
 from dataclasses import dataclass, field, asdict
 from typing import Optional, Dict, Any, List, Tuple
 from datetime import datetime, timezone, timedelta
-import pandas as pd
+
+import aiohttp
 import numpy as np
+import pandas as pd
 
 import discord
 from discord.ext import tasks, commands
 
 from flask import Flask, jsonify
-import threading
 
-VERSION = "3.3.11"
+VERSION = "3.3.14"
 
+# ---------------- Logging ----------------
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
@@ -25,801 +33,665 @@ logging.basicConfig(
 )
 log = logging.getLogger("ScoutTower")
 
-def getenv_int(name: str, default: int) -> int:
-    try:
-        return int(os.getenv(name, str(default)).strip())
-    except Exception:
-        return default
+# ---------------- Helpers ----------------
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc)
 
-def getenv_float(name: str, default: float) -> float:
-    try:
-        return float(os.getenv(name, str(default)).strip())
-    except Exception:
-        return default
+def ts() -> str:
+    return utc_now().strftime("%Y-%m-%d %H:%M:%S")
 
+def rr(entry: float, sl: float, tp: float) -> float:
+    risk = abs(entry - sl)
+    reward = abs(tp - entry)
+    return round(reward / risk, 2) if risk > 0 else 0.0
+
+def clamp(v, lo, hi): return max(lo, min(hi, v))
+
+def pct(a, b):  # (a vs b - 1)*100
+    if b == 0: return 0
+    return (a / b - 1.0) * 100.0
+
+# ---------------- Files/CSV ----------------
+DATA_DIR = Path(os.getenv("DATA_DIR", "./data"))
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+ALERTS_CSV    = DATA_DIR / "alerts.csv"
+DECISIONS_CSV = DATA_DIR / "decisions.csv"
+FILLS_CSV     = DATA_DIR / "fills.csv"
+
+def append_csv(path: Path, row: dict):
+    exists = path.exists()
+    with path.open("a", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=list(row.keys()))
+        if not exists:
+            w.writeheader()
+        w.writerow(row)
+
+# ---------------- Config ----------------
 @dataclass
 class Config:
     token: str = field(default_factory=lambda: os.getenv("DISCORD_TOKEN","").strip())
     sheets_webhook: str = field(default_factory=lambda: os.getenv("GOOGLE_SHEETS_WEBHOOK","").strip())
     sheets_token: Optional[str] = field(default_factory=lambda: os.getenv("SHEETS_TOKEN","").strip() or None)
 
-    signals_channel_id: int = field(default_factory=lambda: getenv_int("SIGNALS_CHANNEL_ID", 1406315590569693346))
-    status_channel_id:  int = field(default_factory=lambda: getenv_int("STATUS_CHANNEL_ID",  1406315723071946887))
-    errors_channel_id:  int = field(default_factory=lambda: getenv_int("ERRORS_CHANNEL_ID",  1406315841330348265))
-    startup_channel_id: int = field(default_factory=lambda: getenv_int("STARTUP_CHANNEL_ID", 1406315936989970485))
+    # Channels
+    signals_channel_id: int = field(default_factory=lambda: int(os.getenv("SIGNALS_CHANNEL_ID","0") or 0))
+    status_channel_id:  int = field(default_factory=lambda: int(os.getenv("STATUS_CHANNEL_ID","0") or 0))
+    errors_channel_id:  int = field(default_factory=lambda: int(os.getenv("ERRORS_CHANNEL_ID","0") or 0))
+    startup_channel_id: int = field(default_factory=lambda: int(os.getenv("STARTUP_CHANNEL_ID","0") or 0))
 
-    provider: str = field(default_factory=lambda: os.getenv("PROVIDER","binance").strip().lower())
-    use_websocket: bool = field(default_factory=lambda: os.getenv("USE_WEBSOCKET","0").strip() == "1")
-    symbol_binance: str = field(default_factory=lambda: os.getenv("SYMBOL_BINANCE","ETHUSDT").strip())
-    symbol_kraken:  str = field(default_factory=lambda: os.getenv("SYMBOL_KRAKEN","ETHUSDT").strip())
+    # Provider + pair
+    provider: str = field(default_factory=lambda: os.getenv("PROVIDER","binance").lower())
+    pair: str = field(default_factory=lambda: os.getenv("PAIR","ETHUSDT"))
+    interval: str = field(default_factory=lambda: os.getenv("INTERVAL","1m"))
 
-    scan_every_seconds: int = field(default_factory=lambda: getenv_int("SCAN_EVERY_SECONDS", 60))
-    alert_cooldown_minutes: int = field(default_factory=lambda: getenv_int("ALERT_COOLDOWN_MINUTES", 15))
-    min_signal_score: float = field(default_factory=lambda: getenv_float("MIN_SIGNAL_SCORE", 3.0))
+    # Engine / scan
+    scan_every_seconds: int = field(default_factory=lambda: int(os.getenv("SCAN_EVERY","30") or 30))
+    min_score: float = field(default_factory=lambda: float(os.getenv("MIN_SCORE","2.5") or 2.5))
+    cooldown_minutes: int = field(default_factory=lambda: int(os.getenv("COOLDOWN_MIN","5") or 5))
+    zone_bps: int = field(default_factory=lambda: int(os.getenv("ZONE_BPS","5") or 5)) # entry band: 5 bps = 0.05%
 
-    risk_atr_mult: float = field(default_factory=lambda: getenv_float("RISK_ATR_MULT", 1.0))
-    tp1_r_multiple: float = field(default_factory=lambda: getenv_float("TP1_R_MULTIPLE", 1.5))
-    tp2_r_multiple: float = field(default_factory=lambda: getenv_float("TP2_R_MULTIPLE", 3.0))
-
-    alert_expire_hours: int = field(default_factory=lambda: getenv_int("ALERT_EXPIRE_HOURS", 24))
-    position_risk_pct: float = field(default_factory=lambda: getenv_float("POSITION_RISK_PCT", 2.0))
-
-    tz_name: str = field(default_factory=lambda: os.getenv("TZ_NAME", "America/Chicago").strip())
-    port: int = field(default_factory=lambda: getenv_int("PORT", 10000))
-
-    # Timeframes
-    fast_interval: str = field(default_factory=lambda: os.getenv("FAST_INTERVAL", "1m").strip())
-    htf_interval: str  = field(default_factory=lambda: os.getenv("HTF_INTERVAL", "15m").strip())
-    buffer_atr_mult: float = field(default_factory=lambda: getenv_float("BUFFER_ATR_MULT", 1.0))
-    min_risk_pct: float   = field(default_factory=lambda: getenv_float("MIN_RISK_PCT", 0.02))
-
-    # Zones + toggles
-    entry_zone_atr_mult: float = field(default_factory=lambda: getenv_float("ENTRY_ZONE_ATR_MULT", 0.25))
-    entry_zone_min_pct:  float = field(default_factory=lambda: getenv_float("ENTRY_ZONE_MIN_PCT", 0.15))  # % of price
-    show_position_size:  bool  = field(default_factory=lambda: os.getenv("SHOW_POSITION_SIZE","0")=="1")
-    account_size_usd:    float = field(default_factory=lambda: getenv_float("ACCOUNT_SIZE_USD", 10000.0))
-
-    def validate(self):
-        if not self.token:
-            raise RuntimeError("DISCORD_TOKEN is required")
-        if not self.sheets_webhook:
-            raise RuntimeError("GOOGLE_SHEETS_WEBHOOK is required")
+    # HTTP
+    port: int = field(default_factory=lambda: int(os.getenv("PORT","10000") or 10000))
 
 CFG = Config()
-CFG.validate()
 
-# ----------- Session Manager -----------
-class SessionManager:
-    _instance = None
-    def __new__(cls):
-        if cls._instance is None:
-            cls._instance = super().__new__(cls)
-            cls._instance.session = None
-        return cls._instance
-    async def get_session(self) -> aiohttp.ClientSession:
-        if not self.session or self.session.closed:
-            timeout = aiohttp.ClientTimeout(total=20)
-            self.session = aiohttp.ClientSession(timeout=timeout)
-        return self.session
-    async def close(self):
-        if self.session and not self.session.closed:
-            await self.session.close()
-            self.session = None
+# ---------------- Discord ----------------
+intents = discord.Intents.default()
+intents.message_content = True
+bot = commands.Bot(command_prefix="!", intents=intents)
 
-session_mgr = SessionManager()
+# ---------------- Indicator Utils ----------------
+def ema(series: pd.Series, n: int) -> pd.Series:
+    return series.ewm(span=n, adjust=False).mean()
 
-# ----------- Helpers -----------
-def fmt_dt(dt: datetime, tzname: str) -> str:
-    try:
-        import pytz
-        tz = pytz.timezone(tzname)
-        return dt.astimezone(tz).strftime("%Y-%m-%d %H:%M:%S %Z")
-    except Exception:
-        return dt.strftime("%Y-%m-%d %H:%M:%S")
-def utc_now() -> datetime:
-    return datetime.now(timezone.utc)
+def rsi(series: pd.Series, n: int = 14) -> pd.Series:
+    delta = series.diff()
+    up = np.where(delta > 0, delta, 0.0)
+    dn = np.where(delta < 0, -delta, 0.0)
+    roll_up = pd.Series(up, index=series.index).rolling(n).mean()
+    roll_dn = pd.Series(dn, index=series.index).rolling(n).mean()
+    rs = roll_up / (roll_dn.replace(0, np.nan))
+    out = 100.0 - (100.0/(1.0+rs))
+    return out.fillna(method="bfill").fillna(50.0)
 
-# ----------- Data & Indicators -----------
-import pandas as pd
-def validate_ohlc_data(df: pd.DataFrame) -> bool:
-    if df is None or df.empty or len(df) < 50:
-        return False
-    if df[["open","high","low","close","volume"]].isnull().any().any():
-        return False
-    invalid = ((df["high"]<df["low"]) | (df["high"]<df["open"]) | (df["high"]<df["close"]) |
-               (df["low"]>df["open"])  | (df["low"]>df["close"]))
-    if invalid.any():
-        return False
-    return True
+def atr(df: pd.DataFrame, n: int = 14) -> pd.Series:
+    h, l, c = df["high"], df["low"], df["close"]
+    tr = np.maximum(h - l, np.maximum(abs(h - c.shift(1)), abs(l - c.shift(1))))
+    return pd.Series(tr).rolling(n).mean().fillna(method="bfill")
 
-class MarketDataProvider:
-    async def fetch_ohlc_interval(self, interval: str = '1m', limit: int = 200):
-        if self.cfg.provider == "binance":
-            df = await self.fetch_binance_klines(self.cfg.symbol_binance, limit=limit, interval=interval)
-            if df is not None and validate_ohlc_data(df): return df
-            df = await self.fetch_kraken_ohlc(self.cfg.symbol_kraken, interval=interval)
-            if df is not None and validate_ohlc_data(df): return df
-        else:
-            df = await self.fetch_kraken_ohlc(self.cfg.symbol_kraken, interval=interval)
-            if df is not None and validate_ohlc_data(df): return df
-            df = await self.fetch_binance_klines(self.cfg.symbol_binance, limit=limit, interval=interval)
-            if df is not None and validate_ohlc_data(df): return df
-        return None
+def vwap(df: pd.DataFrame) -> pd.Series:
+    pv = (df["close"] * df["volume"]).cumsum()
+    vol = df["volume"].cumsum().replace(0, np.nan)
+    return (pv / vol).fillna(df["close"])
 
-    def __init__(self, cfg: Config):
-        self.cfg = cfg
-    async def fetch_binance_klines(self, symbol: str, limit: int = 200, interval: str = '1m'):
-        session = await session_mgr.get_session()
-        url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}"
-        try:
-            async with session.get(url) as r:
-                if r.status != 200:
-                    return None
-                raw = await r.json()
-        except Exception:
-            return None
-        cols = ["open_time","open","high","low","close","volume","close_time","qv","ntrades","tb_base","tb_quote","ignore"]
-        df = pd.DataFrame(raw, columns=cols)
-        df["open_time"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
-        for c in ["open","high","low","close","volume"]:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
-        df.rename(columns={"open_time":"time"}, inplace=True)
-        return df[["time","open","high","low","close","volume"]]
-    async def fetch_kraken_ohlc(self, pair: str, interval: str = '1m'):
-        session = await session_mgr.get_session()
-        # Kraken expects minutes: 1, 5, 15, 60, 240, 1440
-        interval_map = {'1m':1,'5m':5,'15m':15,'1h':60,'4h':240,'1d':1440}
-        kr_int = interval_map.get(interval, 1)
-        url = f"https://api.kraken.com/0/public/OHLC?pair={pair}&interval={kr_int}"
-        try:
-            async with session.get(url) as r:
-                if r.status != 200:
-                    return None
-                raw = await r.json()
-        except Exception:
-            return None
-        if raw.get("error"):
-            return None
-        result = raw.get("result", {})
-        if not result:
-            return None
-        _, data = next(iter(result.items()))
-        df = pd.DataFrame(data, columns=["time","open","high","low","close","vwap","volume","count"])
-        df["time"] = pd.to_datetime(df["time"], unit="s", utc=True)
-        for c in ["open","high","low","close","volume"]:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
-        return df[["time","open","high","low","close","volume"]]
-    async def fetch_ohlc(self, limit: int = 200):
-        # Backward-compat default to fast interval
-        return await self.fetch_ohlc_interval(CFG.fast_interval, limit)
+def donchian(df: pd.DataFrame, n: int = 20) -> Tuple[pd.Series, pd.Series]:
+    dc_u = df["high"].rolling(n).max()
+    dc_l = df["low"].rolling(n).min()
+    return dc_u, dc_l
 
-        if CFG.provider == "binance":
-            df = await self.fetch_binance_klines(CFG.symbol_binance, limit)
-            if df is not None and validate_ohlc_data(df): return df
-            df = await self.fetch_kraken_ohlc(CFG.symbol_kraken); 
-            if df is not None and validate_ohlc_data(df): return df
-        else:
-            df = await self.fetch_kraken_ohlc(CFG.symbol_kraken)
-            if df is not None and validate_ohlc_data(df): return df
-            df = await self.fetch_binance_klines(CFG.symbol_binance, limit)
-            if df is not None and validate_ohlc_data(df): return df
-        return None
-
-def ema(s: pd.Series, n: int): return s.ewm(span=n, adjust=False).mean()
-def rsi(s: pd.Series, n: int=14):
-    d=s.diff(); up=d.clip(lower=0); dn=-1*d.clip(upper=0)
-    ma_up=up.ewm(alpha=1/n, adjust=False).mean(); ma_dn=dn.ewm(alpha=1/n, adjust=False).mean()
-    rs = ma_up/(ma_dn+1e-12); return 100-(100/(1+rs))
-def atr(df: pd.DataFrame, n: int=14):
-    hl=df["high"]-df["low"]; hc=(df["high"]-df["close"].shift()).abs(); lc=(df["low"]-df["close"].shift()).abs()
-    tr=pd.concat([hl,hc,lc],axis=1).max(axis=1); return tr.ewm(alpha=1/n, adjust=False).mean()
-def vwap(df: pd.DataFrame):
-    pv=(df["close"]*df["volume"]).cumsum(); vv=df["volume"].replace(0,np.nan).cumsum()
-    return (pv/vv).ffill().fillna(df["close"])
-def donchian(df: pd.DataFrame, n: int=20):
-    up=df["high"].rolling(n).max(); lo=df["low"].rolling(n).min(); return up,lo
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    df=df.copy()
-    df["ema20"]=ema(df["close"],20); df["ema50"]=ema(df["close"],50)
-    df["rsi"]=rsi(df["close"],14); df["atr"]=atr(df,14); df["vwap"]=vwap(df)
-    dc_u,dc_l=donchian(df,20); df["dc_u"]=dc_u; df["dc_l"]=dc_l; return df
+    df = df.copy()
+    df["ema20"] = ema(df["close"], 20)
+    df["ema50"] = ema(df["close"], 50)
+    df["rsi"]   = rsi(df["close"], 14)
+    df["atr"]   = atr(df, 14)
+    df["vwap"]  = vwap(df)
+    dc_u, dc_l  = donchian(df, 20)
+    df["dc_u"], df["dc_l"] = dc_u, dc_l
+    return df
 
-DATA_DIR = pathlib.Path(os.getenv("DATA_DIR","./data")); DATA_DIR.mkdir(parents=True, exist_ok=True)
-ALERTS_CSV = DATA_DIR/"alerts.csv"; DECISIONS_CSV = DATA_DIR/"decisions.csv"; FILLS_CSV = DATA_DIR/"fills.csv"
+# ---------------- Market Data Providers ----------------
+class MarketData:
+    def __init__(self, pair: str, interval: str):
+        self.pair = pair
+        self.interval = interval
 
-def append_csv(path: pathlib.Path, row: Dict[str, Any]):
-    exists = path.exists()
-    with path.open("a", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=list(row.keys()))
-        if not exists: w.writeheader()
-        w.writerow(row)
+    async def fetch_binance(self, session: aiohttp.ClientSession, limit: int = 250) -> Optional[pd.DataFrame]:
+        # Binance klines
+        m = {
+            "1m":"1m","3m":"3m","5m":"5m","15m":"15m","30m":"30m",
+            "1h":"1h","2h":"2h","4h":"4h","1d":"1d"
+        }.get(self.interval, "1m")
+        url = f"https://api.binance.com/api/v3/klines?symbol={self.pair}&interval={m}&limit={limit}"
+        async with session.get(url, timeout=20) as r:
+            if r.status != 200:
+                raise RuntimeError(f"Binance status {r.status}")
+            data = await r.json()
+        cols = ["open_time","open","high","low","close","volume","close_time","qav","trades","taker_base","taker_quote","ignore"]
+        df = pd.DataFrame(data, columns=cols)
+        for col in ["open","high","low","close","volume"]:
+            df[col] = df[col].astype(float)
+        df["time"] = pd.to_datetime(df["close_time"], unit="ms", utc=True)
+        return df[["time","open","high","low","close","volume"]].set_index("time")
 
+    async def fetch_kraken(self, session: aiohttp.ClientSession, limit: int = 250) -> Optional[pd.DataFrame]:
+        pair = "XETHZUSD" if self.pair.upper().endswith("USD") else "XETHZUSDT"
+        interval_map = {"1m":"1","5m":"5","15m":"15","30m":"30","1h":"60","4h":"240","1d":"1440"}
+        i = interval_map.get(self.interval, "1")
+        url = f"https://api.kraken.com/0/public/OHLC?pair={pair}&interval={i}"
+        async with session.get(url, timeout=20) as r:
+            if r.status != 200:
+                raise RuntimeError(f"Kraken status {r.status}")
+            data = await r.json()
+        key = next(iter(data["result"]))
+        arr = data["result"][key]
+        cols = ["time","open","high","low","close","vwap","volume","count"]
+        df = pd.DataFrame(arr, columns=cols)
+        for col in ["open","high","low","close","volume"]:
+            df[col] = df[col].astype(float)
+        df["time"] = pd.to_datetime(df["time"], unit="s", utc=True)
+        return df[["time","open","high","low","close","volume"]].set_index("time")
+
+    async def fetch_ohlc(self, limit: int = 250) -> Optional[pd.DataFrame]:
+        async with aiohttp.ClientSession() as session:
+            try:
+                return await self.fetch_binance(session, limit=limit)
+            except Exception as e:
+                log.warning(f"Binance failed: {e}; trying Kraken...")
+                try:
+                    return await self.fetch_kraken(session, limit=limit)
+                except Exception as e2:
+                    log.error(f"Kraken failed: {e2}")
+                    return None
+
+# ---------------- Sheets Integration ----------------
+class GoogleSheetsIntegration:
+    def __init__(self, url: Optional[str], token: Optional[str]):
+        self.url = url
+        self.token = token
+
+    async def post(self, payload: dict) -> bool:
+        if not self.url:
+            return False
+        headers = {"Content-Type":"application/json"}
+        if self.token:
+            headers["x-app-secret"] = self.token
+        try:
+            async with aiohttp.ClientSession() as s:
+                async with s.post(self.url, data=json.dumps(payload), headers=headers, timeout=15) as r:
+                    ok = (r.status//100)==2
+                    if not ok:
+                        txt = await r.text()
+                        log.error(f"Sheets POST {r.status}: {txt}")
+                    return ok
+        except Exception as e:
+            log.error(f"Sheets POST error: {e}")
+            return False
+
+    async def rehydrate_open_trades(self) -> List[dict]:
+        # GET /exec?action=open (optional)
+        if not self.url:
+            return []
+        try:
+            async with aiohttp.ClientSession() as s:
+                sep = "&" if "?" in self.url else "?"
+                url = f"{self.url}{sep}action=open"
+                if self.token:
+                    url += f"&key={self.token}"
+                async with s.get(url, timeout=15) as r:
+                    if (r.status//100)==2:
+                        return await r.json()
+        except Exception as e:
+            log.error(f"Sheets rehydrate error: {e}")
+        return []
+
+# ---------------- Trade Structures ----------------
 @dataclass
-class TradeData:
+class Trade:
     id: str
     pair: str
-    side: str
-    entry_price: float
-    stop_loss: float
-    take_profit_1: float
-    take_profit_2: float
-    status: str = "OPEN"
-    timestamp: str = field(default_factory=lambda: utc_now().isoformat())
-    level_name: Optional[str] = None
-    level_price: Optional[float] = None
-    confidence: Optional[str] = None
-    knight: Optional[str] = "Sir Leonis"
-    score: Optional[float] = None
-    market_context: Optional[str] = None
+    side: str  # LONG/SHORT
+    zone_lo: float
+    zone_hi: float
+    entry: Optional[float]
+    sl: float
+    tp1: float
+    tp2: float
+    opened_at: str
+    status: str = "OPEN"  # OPEN/CLOSED
+    notes: str = ""
+    rr1: float = 0.0
+    rr2: float = 0.0
 
-class GoogleSheetsIntegration:
-
-    def _normalize_keys(self, row: Dict[str, Any]) -> Dict[str, Any]:
-        """Map pretty Sheet headers to internal snake_case keys."""
-        mapping = {
-            "trade id": "trade_id",
-            "asset": "asset",
-            "direction": "side",
-            "entry price": "entry_price",
-            "stop loss": "stop_loss",
-            "take profit 1": "take_profit_1",
-            "take profit 2": "take_profit_2",
-            "status": "status",
-            "exit price": "exit_price",
-            "exit reason": "exit_reason",
-            "pnl %": "pnl_pct",
-            "timestamp": "timestamp",
-            "level name": "level_name",
-            "level price": "level_price",
-            "entry low": "entry_low",
-            "entry high": "entry_high",
-            "confidence": "confidence",
-            "knight": "knight",
-            "original score": "score",
-            # fallbacks seen in some payloads
-            "pair": "asset",
-            "direction/side": "side",
-        }
-        out = {}
-        for k, v in row.items():
-            kk = (k or "").strip().lower()
-            out[mapping.get(kk, kk)] = v
-        return out
-
-    def _to_float(self, v, default=0.0) -> float:
-        try:
-            if v in (None, ""): return default
-            if isinstance(v, (int, float)): return float(v)
-            return float(str(v).replace(',', '').strip())
-        except Exception:
-            return default
-    def __init__(self, url: str, token: Optional[str] = None):
-        self.url=url; self.token=token
-    async def _post(self, payload: Dict[str, Any]) -> Dict[str, Any]:
-        session = await session_mgr.get_session()
-        headers={"Content-Type":"application/json"}
-        url = self.url
-        if self.token:
-            headers["x-app-secret"]=self.token
-            joiner = "&" if ("?" in url) else "?"
-            url = f"{url}{joiner}key={self.token}"
-        try:
-            async with session.post(url, data=json.dumps(payload), headers=headers) as r:
-                txt = await r.text()
-                try:
-                    data = json.loads(txt) if txt else {}
-                except Exception:
-                    data = {"status":"error","message":"non-json","raw":txt[:200]}
-                # include http status for diagnostics
-                if isinstance(data, dict) and "http_status" not in data:
-                    data["http_status"] = r.status
-                return data if data else {"status":"error","message":"empty","http_status": r.status}
-        except Exception as e:
-            return {"status":"error","message":str(e)}
-    async def _get(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        session = await session_mgr.get_session()
-        headers={}
-        qp=dict(params)
-        if self.token:
-            headers["x-app-secret"]=self.token; qp["key"]=self.token
-        try:
-            async with session.get(self.url, params=qp, headers=headers) as r:
-                txt = await r.text()
-                try: return json.loads(txt) if txt else {"status":"error","message":"empty"}
-                except Exception: return {"status":"error","message":"non-json","raw":txt[:200]}
-        except Exception as e:
-            return {"status":"error","message":str(e)}
-    async def write_entry(self, t: TradeData) -> Dict[str, Any]:
-        payload = {
-            "id": t.id, "pair": t.pair, "side": t.side,
-            "entry_price": t.entry_price, "stop_loss": t.stop_loss,
-            "take_profit_1": t.take_profit_1, "take_profit_2": t.take_profit_2,
-            "status": t.status, "timestamp": t.timestamp, "level_name": t.level_name,
-            "level_price": t.level_price, "confidence": t.confidence, "knight": t.knight,
-            "score": t.score, "market_context": t.market_context, "entry_low": getattr(t, "entry_low", None), "entry_high": getattr(t, "entry_high", None)
-        }
-        if self.token:
-            payload["token"] = self.token
-
-            payload["token"] = self.token
-        return await self._post(payload)
-    async def write_entry_with_retry(self, t: TradeData, max_retries: int = 3) -> Dict[str, Any]:
-        for i in range(max_retries):
-            res = await self.write_entry(t)
-            if res.get("status")!="error": return res
-            await asyncio.sleep(2**i)
-        return res
-    async def update_exit(self, trade_id: str, exit_price: float, exit_reason: str, pnl_pct: float):
-        return await self._post({"action":"update","id":trade_id,"exit_price":exit_price,"exit_reason":exit_reason,"pnl_pct":pnl_pct,"status":"CLOSED"})
-    
-
+# ---------------- Trade Manager ----------------
 class TradeManager:
     def __init__(self, cfg: Config, sheets: GoogleSheetsIntegration):
-        self.cfg=cfg; self.sheets=sheets
-        self.active: Dict[str, TradeData] = {}
-        self.cooldown_until: Dict[str, float] = {}
-        self.tp1_hits=set()
+        self.cfg = cfg
+        self.sheets = sheets
+        self.active: Dict[str, Trade] = {}
+        self.muted: bool = False
+        self.metrics = None  # attached later
 
-    async def rehydrate(self):
-        try:
-            rows: List[TradeData] = []
-            if hasattr(self.sheets, "rehydrate_open_trades"):
-                rows = await self.sheets.rehydrate_open_trades()
-            else:
-                data = await self.sheets._get({"action": "open"})
-                raw = (data.get("trades", []) or data.get("rows", []) or data.get("data", []) or [])
-                for r in raw:
-                    k = { (str(k) if k is not None else '').strip().lower(): v for k, v in r.items() }
-                    if str(k.get("status","")).strip().upper() != "OPEN":
-                        continue
-                    td = TradeData(
-                        id=str(k.get("trade id") or k.get("trade_id") or ""),
-                        pair=str(k.get("asset") or "ETH/USDT"),
-                        side=str(k.get("direction") or "LONG").capitalize(),
-                        entry_price=float(k.get("entry price") or k.get("entry_price") or 0) if (k.get("entry price") or k.get("entry_price")) not in (None,"") else 0.0,
-                        stop_loss=float(k.get("stop loss") or k.get("stop_loss") or 0) if (k.get("stop loss") or k.get("stop_loss")) not in (None,"") else 0.0,
-                        take_profit_1=float(k.get("take profit 1") or k.get("take_profit_1") or 0) if (k.get("take profit 1") or k.get("take_profit_1")) not in (None,"") else 0.0,
-                        take_profit_2=float(k.get("take profit 2") or k.get("take_profit_2") or 0) if (k.get("take profit 2") or k.get("take_profit_2")) not in (None,"") else 0.0,
-                        status="OPEN",
-                        timestamp=str(k.get("timestamp") or utc_now().isoformat()),
-                    )
-                    el = k.get("entry low") or k.get("entry_low")
-                    eh = k.get("entry high") or k.get("entry_high")
-                    if el not in (None, ""):
-                        try: td.entry_low = float(str(el).replace(',',''))
-                        except: pass
-                    if eh not in (None, ""):
-                        try: td.entry_high = float(str(eh).replace(',',''))
-                        except: pass
-                    rows.append(td)
-            for t in rows:
-                self.active[t.id] = t
-            log.info(f"Rehydrated {len(rows)} open alerts from Sheets.")
-            return len(rows)
-        except Exception as e:
-            log.warning(f"rehydrate error: {e}")
-            return 0
+    def _new_id(self) -> str:
+        return f"T{int(time.time()*1000)%10_000_000}"
 
-    def on_cooldown(self, side:str)->bool:
-        return time.time() < self.cooldown_until.get(side, 0)
-    def set_cooldown(self, side:str):
-        self.cooldown_until[side] = time.time() + self.cfg.alert_cooldown_minutes*60
-    def calculate_pnl(self, t: TradeData, price: float) -> float:
-        d=1 if t.side.upper()=="LONG" else -1; return d*(price-t.entry_price)/t.entry_price*100.0
-    async def open_trade(self, t: TradeData):
-        self.active[t.id]=t; append_csv(ALERTS_CSV, {**asdict(t), "opened_at": utc_now().isoformat()})
-        res = await self.sheets.write_entry_with_retry(t)
-        try:
-            http_status = res.get("http_status") if isinstance(res, dict) else None
-            if isinstance(res, dict) and (res.get("status") == "error" or (http_status and int(http_status) >= 400)):
-                # Post an error embed to errors channel for visibility
-                from discord import Embed
-                msg = f"Google Sheets write failed for {t.id}: {res}";
-                # Lazy import of dio from globals
+    async def open_trade(self, side: str, zone_lo: float, zone_hi: float, sl: float, tp1: float, tp2: float, price_now: float) -> Trade:
+        t = Trade(
+            id=self._new_id(),
+            pair=self.cfg.pair,
+            side=side,
+            zone_lo=zone_lo, zone_hi=zone_hi,
+            entry=None,
+            sl=sl, tp1=tp1, tp2=tp2,
+            opened_at=ts(),
+        )
+        t.rr1 = rr((zone_lo+zone_hi)/2.0, sl, tp1)
+        t.rr2 = rr((zone_lo+zone_hi)/2.0, sl, tp2)
+        self.active[t.id] = t
+
+        append_csv(ALERTS_CSV, {
+            "id": t.id, "time": t.opened_at, "pair": t.pair, "side": t.side,
+            "zone_lo": t.zone_lo, "zone_hi": t.zone_hi, "sl": t.sl, "tp1": t.tp1, "tp2": t.tp2,
+            "rr1": t.rr1, "rr2": t.rr2
+        })
+        asyncio.create_task(self.sheets.post({"action":"entry", **asdict(t)}))
+        return t
+
+    async def close_trade(self, trade_id: str, exit_price: float, reason: str = "manual"):
+        t = self.active.pop(trade_id, None)
+        if not t: return False
+        t.status = "CLOSED"
+        pnl_pct = pct(exit_price, (t.zone_lo+t.zone_hi)/2.0) * (1 if t.side=="LONG" else -1)
+        append_csv(FILLS_CSV, {
+            "id": t.id, "time": ts(), "pair": t.pair, "side": t.side,
+            "exit_price": exit_price, "reason": reason, "pnl_pct": round(pnl_pct,2)
+        })
+        asyncio.create_task(self.sheets.post({"action":"update", "id": t.id, "status":"CLOSED",
+                                              "exit_price": exit_price, "exit_reason": reason, "pnl_pct": round(pnl_pct,2)}))
+        return True
+
+    def snapshot_active(self) -> List[dict]:
+        out = []
+        for t in self.active.values():
+            out.append({
+                "id": t.id, "side": t.side, "zone": f"{t.zone_lo:.2f}-{t.zone_hi:.2f}",
+                "sl": round(t.sl,2), "tp1": round(t.tp1,2), "tp2": round(t.tp2,2), "opened": t.opened_at
+            })
+        return out
+
+# ---------------- Metrics ----------------
+class SignalMetrics:
+    """Compute basic performance stats from fills.csv on demand"""
+    def __init__(self):
+        pass
+
+    def _read_pnls(self) -> List[float]:
+        if not FILLS_CSV.exists(): return []
+        vals = []
+        with FILLS_CSV.open("r") as f:
+            r = csv.DictReader(f)
+            for row in r:
                 try:
-                    await dio.safe_send(CFG.errors_channel_id, embed=build_error_embed(msg, CFG))
+                    vals.append(float(row.get("pnl_pct", 0)))
                 except Exception:
                     pass
-        except Exception:
-            pass
-    async def close_trade(self, trade_id: str, exit_price: float, reason:str):
-        t = self.active.get(trade_id)
-        if not t:
-            return None
-        pnl=self.calculate_pnl(t, exit_price)
-        await self.sheets.update_exit(trade_id, exit_price, reason, pnl)
-        append_csv(FILLS_CSV, {"id":trade_id,"exit_price":exit_price,"reason":reason,"pnl_pct":pnl,"score":t.score,"time":utc_now().isoformat()})
-        t.status="CLOSED"; self.active.pop(trade_id,None); self.tp1_hits.discard(trade_id); return pnl
-    async def check_alert_exits(self, price: float):
-        closed=[]; 
-        for tid,t in list(self.active.items()):
-            exit_reason=None; exit_price=price
-            if t.side=="LONG":
-                if price<=t.stop_loss: exit_reason="Stop Loss Hit"
-                elif price>=t.take_profit_2: exit_reason="TP2 Hit"
-                elif price>=t.take_profit_1 and tid not in self.tp1_hits: self.tp1_hits.add(tid)
-            else:
-                if price>=t.stop_loss: exit_reason="Stop Loss Hit"
-                elif price<=t.take_profit_2: exit_reason="TP2 Hit"
-                elif price<=t.take_profit_1 and tid not in self.tp1_hits: self.tp1_hits.add(tid)
-            if exit_reason:
-                pnl=await self.close_trade(tid, exit_price, exit_reason)
-                if pnl is not None: closed.append({"trade":t,"exit_price":exit_price,"exit_reason":exit_reason,"pnl_pct":pnl})
-        return closed
+        return vals
 
-@dataclass
-class Signal:
-    side: str; score: float; entry: float; stop: float; tp1: float; tp2: float; reason: str
-    market_context: str = ""; entry_low: float = 0.0; entry_high: float = 0.0; entry_label: str = ""
+    def stats(self) -> dict:
+        pnls = self._read_pnls()
+        wins = [x for x in pnls if x > 0]
+        losses = [x for x in pnls if x <= 0]
+        avg_win = sum(wins)/len(wins) if wins else 0.0
+        avg_loss = sum(losses)/len(losses) if losses else 0.0
+        wr = (len(wins)/len(pnls))*100 if pnls else 0.0
+        sr = (np.mean(pnls)/np.std(pnls)) if len(pnls)>1 and np.std(pnls)>0 else 0.0
+        return {
+            "count": len(pnls),
+            "win_rate_pct": round(wr,1),
+            "avg_win_pct": round(avg_win,2),
+            "avg_loss_pct": round(avg_loss,2),
+            "sharpe_like": round(float(sr),2),
+        }
 
-def get_market_context(df: pd.DataFrame)->str:
-    latest=df.iloc[-1]; ctx=[]
-    ctx.append("📈 Uptrend (EMA20>50)" if latest["ema20"]>latest["ema50"] else "📉 Downtrend (EMA20<50)")
-    if latest["rsi"]>70: ctx.append("⚠️ RSI Overbought")
-    elif latest["rsi"]<30: ctx.append("⚠️ RSI Oversold")
-    elif latest["rsi"]>60: ctx.append("💪 RSI Strong")
-    elif latest["rsi"]<40: ctx.append("😟 RSI Weak")
-    atr_pct=(latest["atr"]/latest["close"])*100
-    ctx.append("🌊 High Volatility" if atr_pct>3 else "😴 Low Volatility" if atr_pct<1 else "⚖️ Normal Volatility")
-    ctx.append("✅ Above VWAP" if latest["close"]>latest["vwap"] else "❌ Below VWAP")
-    return " | ".join(ctx)
+def attach_metrics(tm: TradeManager):
+    if getattr(tm, "metrics", None) is None:
+        tm.metrics = SignalMetrics()
 
-class EnhancedSignalEngine:
-    def __init__(self, cfg: Config): self.cfg=cfg
+# ---------------- Presets (modes) ----------------
+PRESETS = {
+    "testing": {"scan": 15,  "min_score": 2.0, "cooldown": 2},
+    "level1":  {"scan": 30,  "min_score": 2.5, "cooldown": 5},
+    "level2":  {"scan": 60,  "min_score": 3.0, "cooldown": 15},
+    "level3":  {"scan": 120, "min_score": 4.0, "cooldown": 30},
+}
+def _mode_alias(s: str) -> str:
+    s = (s or "").strip().lower()
+    return {
+        "l1":"level1","level 1":"level1",
+        "l2":"level2","level 2":"level2",
+        "l3":"level3","level 3":"level3",
+        "t":"testing","test":"testing"
+    }.get(s, s)
 
-    def _min_risk(self, price: float) -> float:
-        # Ensure we never end up with zero-risk distance
-        return max(price * (self.cfg.min_risk_pct/100.0), 0.01)
+async def apply_preset(name: str) -> dict:
+    key = _mode_alias(name)
+    if key not in PRESETS:
+        raise ValueError("Unknown mode")
+    p = PRESETS[key]
+    CFG.scan_every_seconds = int(p["scan"])
+    CFG.min_score = float(p["min_score"])
+    CFG.cooldown_minutes = int(p["cooldown"])
+    return {"mode": key, **p}
 
-    def _structure_targets(self, entry_mid: float, entry_low: float, entry_high: float, side: str, atr_htf: float):
-        buf = max(self.cfg.buffer_atr_mult * max(atr_htf, 0.0), self._min_risk(entry_mid))
-        if side == "LONG":
-            sl = float(entry_low) - buf
-            risk = max(entry_mid - sl, self._min_risk(entry_mid))
-            tp1 = entry_mid + 1.5 * risk
-            tp2 = entry_mid + 3.0 * risk
-        else:
-            sl = float(entry_high) + buf
-            risk = max(sl - entry_mid, self._min_risk(entry_mid))
-            tp1 = entry_mid - 1.5 * risk
-            tp2 = entry_mid - 3.0 * risk
-        return sl, tp1, tp2
+def current_mode_snapshot() -> dict:
+    return {
+        "scan": CFG.scan_every_seconds,
+        "min_score": CFG.min_score,
+        "cooldown": CFG.cooldown_minutes
+    }
 
-    def format_signal_reason(self, parts: List[str], score: float)->str:
-        conf = "🔥 STRONG" if score>=4.5 else "✅ GOOD" if score>=3.5 else "⚡ MODERATE"
-        s=f"**Signal Confidence: {conf} (Score: {score:.1f}/6.0)**\n\n**Triggered Conditions:**\n"
-        for i,p in enumerate(parts,1): s+=f"{i}. {p}\n"; return s
-    def generate(self, df_fast: pd.DataFrame, df_htf: pd.DataFrame) -> Optional[Signal]:
-        if df_fast is None or len(df_fast)<60 or df_htf is None or len(df_htf)<30: return None
-        latest=df_fast.iloc[-1]; prev=df_fast.iloc[-2]
-        up = latest["ema20"]>latest["ema50"]; dn = latest["ema20"]<latest["ema50"]
-        sl=0.0; score_l=0.0; parts_l=[]; ss=0.0; score_s=0.0; parts_s=[]
-        breakout_l = latest["close"]>latest["dc_u"] and up and latest["close"]>latest["vwap"]
-        if breakout_l: score_l+=1; parts_l.append("Breakout above Donchian & VWAP in uptrend")
-        breakout_s = latest["close"]<latest["dc_l"] and dn and latest["close"]<latest["vwap"]
-        if breakout_s: score_s+=1; parts_s.append("Breakdown below Donchian & VWAP in downtrend")
-        bounced_l = (prev["close"]<prev["ema20"]) and (latest["close"]>latest["ema20"]) and up and latest["rsi"]>50
-        if bounced_l: score_l+=1; parts_l.append("Pullback bounce on EMA20 with RSI>50")
-        bounced_s = (prev["close"]>prev["ema20"]) and (latest["close"]<latest["ema20"]) and dn and latest["rsi"]<50
-        if bounced_s: score_s+=1; parts_s.append("Pullback bounce under EMA20 with RSI<50")
-        cont_l = up and latest["close"]>latest["ema20"] and latest["rsi"]>55 and latest["atr"]>df_fast["atr"].iloc[-15]
-        if cont_l: score_l+=1; parts_l.append("Continuation: >EMA20, RSI>55, ATR rising")
-        cont_s = dn and latest["close"]<latest["ema20"] and latest["rsi"]<45 and latest["atr"]>df_fast["atr"].iloc[-15]
-        if cont_s: score_s+=1; parts_s.append("Continuation: <EMA20, RSI<45, ATR rising")
-        body=abs(latest["close"]-latest["open"]); rng=latest["high"]-latest["low"]; atrv=float(latest["atr"])
-        if rng>0 and atrv>0:
-            body_ratio=body/max(rng,1e-9); atr_ratio=rng/atrv
-            if body_ratio>0.5:
-                if latest["close"]>latest["open"]: score_l+=0.5; parts_l.append("Strong bullish candle")
-                else: score_s+=0.5; parts_s.append("Strong bearish candle")
-            if atr_ratio>1.1:
-                if score_l>=score_s: score_l+=0.5; parts_l.append("High range expansion")
-                else: score_s+=0.5; parts_s.append("High range expansion")
-        side=None; score=0.0; price=float(latest["close"])
-        if score_l>=score_s and score_l>=CFG.min_signal_score:
-            side="LONG"; score=score_l; reasons=self.format_signal_reason(parts_l, score)
-        elif score_s>score_l and score_s>=CFG.min_signal_score:
-            side="SHORT"; score=score_s; reasons=self.format_signal_reason(parts_s, score)
-        else:
-            return None
-        atr_htf = float(df_htf["atr"].iloc[-1]) if "atr" in df_htf.columns else float('nan')
-        market_ctx = get_market_context(df_fast)
-        zone_w = max(atrv*CFG.entry_zone_atr_mult, price*(CFG.entry_zone_min_pct/100.0))
-        if side=="LONG":
-            if "Breakout" in reasons:
-                base=float(latest["dc_u"]); entry_low=max(base, price-zone_w/2); entry_high=price+zone_w/2; entry_label="Breakout entry"
-            else:
-                ema20=float(latest["ema20"]); entry_low=ema20-zone_w; entry_high=ema20; entry_label="Pullback entry"
-        else:
-            if "Breakdown" in reasons:
-                base=float(latest["dc_l"]); entry_low=price-zone_w/2; entry_high=min(base, price+zone_w/2); entry_label="Breakdown entry"
-            else:
-                ema20=float(latest["ema20"]); entry_low=ema20; entry_high=ema20+zone_w; entry_label="Pullback entry"
-        entry_mid=(entry_low+entry_high)/2.0
-        # Structure-based targets with HTF ATR buffer
-        stop, tp1, tp2 = self._structure_targets(entry_mid, entry_low, entry_high, side, atr_htf if not np.isnan(atr_htf) else atrv)
-        # guard: refuse zero-risk signals
-        if abs(entry_mid - stop) < 1e-9:
-            return None
-        return Signal(side=side, score=round(score,2), entry=entry_mid, stop=stop, tp1=tp1, tp2=tp2,
-                      reason=reasons, market_context=market_ctx, entry_low=entry_low, entry_high=entry_high, entry_label=entry_label)
+# ---------------- Signal Engine ----------------
+def score_signal(df: pd.DataFrame, i: int, side: str) -> float:
+    row = df.iloc[i]
+    ema_trend = (row["ema20"] > row["ema50"]) if side=="LONG" else (row["ema20"] < row["ema50"])
+    rsi_ok = (row["rsi"] > 45) if side=="LONG" else (row["rsi"] < 55)
+    vwap_ok = (row["close"] >= row["vwap"]) if side=="LONG" else (row["close"] <= row["vwap"])
 
-def calculate_position_size(balance: float, risk_pct: float, entry: float, stop: float)->float:
-    pr=abs(entry-stop)
-    if pr<=0: return 0.0
-    risk_amount=balance*(risk_pct/100)
-    return round(risk_amount/pr,4)
+    base = 0.0
+    base += 1.0 if ema_trend else 0.0
+    base += 0.7 if rsi_ok else 0.0
+    base += 0.7 if vwap_ok else 0.0
+    # candle body quality
+    body = abs(row["close"] - row["open"])
+    rng  = row["high"] - row["low"]
+    body_ok = (body >= 0.5 * rng) if rng > 0 else False
+    base += 0.6 if body_ok else 0.0
+    return round(base, 2)
 
-intents = discord.Intents.default(); intents.message_content=True
-bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
+def generate_signal(df: pd.DataFrame, price_now: float) -> Optional[dict]:
+    i = len(df)-1
+    row = df.iloc[i]
+    # breakouts
+    if row["close"] > row["dc_u"] and row["ema20"] > row["ema50"]:
+        side = "LONG"
+        score = score_signal(df, i, side)
+        if score < CFG.min_score: return None
+        atrv = float(row["atr"])
+        level = float(row["dc_u"])
+        zone = (level*(1 - CFG.zone_bps/10000.0), level*(1 + CFG.zone_bps/10000.0))
+        sl = row["ema50"] - 0.5*atrv
+        tp1 = level + 1.5*atrv
+        tp2 = level + 3.0*atrv
+        return {"side": side, "zone": zone, "sl": float(sl), "tp1": float(tp1), "tp2": float(tp2), "score": score}
 
-class DiscordIO:
-    def __init__(self, cfg: Config, client: commands.Bot): self.cfg=cfg; self.client=client
-    def channel(self, cid:int): return self.client.get_channel(cid)
-    async def safe_send(self, cid:int, embed: 'discord.Embed'=None, **k):
-        ch=self.channel(cid) or await self.client.fetch_channel(cid)
-        if not ch: return
-        await ch.send(embed=(embed or discord.Embed(**k)))
+    if row["close"] < row["dc_l"] and row["ema20"] < row["ema50"]:
+        side = "SHORT"
+        score = score_signal(df, i, side)
+        if score < CFG.min_score: return None
+        atrv = float(row["atr"])
+        level = float(row["dc_l"])
+        zone = (level*(1 - CFG.zone_bps/10000.0), level*(1 + CFG.zone_bps/10000.0))
+        sl = row["ema50"] + 0.5*atrv
+        tp1 = level - 1.5*atrv
+        tp2 = level - 3.0*atrv
+        return {"side": side, "zone": zone, "sl": float(sl), "tp1": float(tp1), "tp2": float(tp2), "score": score}
+    return None
 
-def build_trade_embed(t: TradeData, cfg: Config)->discord.Embed:
-    now=utc_now(); ct=fmt_dt(now, cfg.tz_name)
-    risk_pts=abs(t.entry_price-t.stop_loss); tp1_pts=abs(t.take_profit_1-t.entry_price); tp2_pts=abs(t.take_profit_2-t.entry_price)
-    risk_pct=(risk_pts/t.entry_price*100) if t.entry_price else 0; tp1_pct=(tp1_pts/t.entry_price*100) if t.entry_price else 0; tp2_pct=(tp2_pts/t.entry_price*100) if t.entry_price else 0
-    zone_low=getattr(t,"entry_low",t.entry_price); zone_high=getattr(t,"entry_high",t.entry_price); label=getattr(t,"entry_label","")
-    desc=((f"**{label}**\n" if label else "") + f"**Entry Zone**: ${zone_low:.2f} – ${zone_high:.2f}\n"
-          f"**Stop Loss**: ${t.stop_loss:.2f} ({risk_pct:.2f}%)\n"
-          f"**TP1**: ${t.take_profit_1:.2f} ({tp1_pct:.2f}%)\n"
-          f"**TP2**: ${t.take_profit_2:.2f} ({tp2_pct:.2f}%)\n\n")
-    if t.level_name: desc += f"{t.level_name}\n\n"
-    if t.market_context: desc += f"**Market Context:**\n{t.market_context}\n\n"
-    if cfg.show_position_size:
-        ps=calculate_position_size(cfg.account_size_usd, cfg.position_risk_pct, t.entry_price, t.stop_loss)
-        desc+=f"**Position Size ({cfg.position_risk_pct:.1f}% risk on ${cfg.account_size_usd:,.0f}):** {ps:.4f} ETH"
-    color=0x4CAF50 if t.side.upper()=="LONG" else 0xF44336
-    emb=discord.Embed(title=f"⚔️ Battle Signal — {t.pair} ({t.side})", description=desc, color=color, timestamp=now)
-    emb.add_field(name="Alert ID", value=t.id, inline=True)
-    if t.score is not None: emb.add_field(name="Score", value=f"{t.score:.2f}/6.0", inline=True)
-    risk=abs(t.entry_price-t.stop_loss); reward=abs(t.take_profit_2-t.entry_price); rr=reward/risk if risk>0 else 0
-    emb.add_field(name="R:R", value=f"1:{rr:.1f}", inline=True)
-    emb.set_footer(text=f"CT: {ct} • UTC: {now.strftime('%Y-%m-%d %H:%M:%S UTC')}"); return emb
+# ---------------- Embeds ----------------
+def embed_trade_open(t: Trade, price_now: float) -> discord.Embed:
+    title = f"🗼 Scout Tower | {t.pair} {t.side}"
+    e = discord.Embed(title=title, colour=discord.Colour.blue(), timestamp=utc_now())
+    e.add_field(name="Entry Zone", value=f"{t.zone_lo:.2f} → {t.zone_hi:.2f}", inline=True)
+    e.add_field(name="Stop Loss", value=f"{t.sl:.2f}", inline=True)
+    e.add_field(name="TP1 / TP2", value=f"{t.tp1:.2f} / {t.tp2:.2f}", inline=True)
+    e.add_field(name="R:R (TP1/TP2)", value=f"{t.rr1} / {t.rr2}", inline=True)
+    e.set_footer(text=f"v{VERSION} • {utc_now().strftime('%Y-%m-%d %H:%M:%S')} UTC")
+    return e
 
-def build_exit_embed(info: Dict, cfg: Config)->discord.Embed:
-    t=info['trade']; pnl=info['pnl_pct']; reason=info['exit_reason']; px=info['exit_price']
-    now=utc_now(); ct=fmt_dt(now,cfg.tz_name); color=0x4CAF50 if pnl>0 else 0xF44336; emoji="✅" if pnl>0 else "❌"
-    emb=discord.Embed(title=f"{emoji} Alert Closed: {'WIN' if pnl>0 else 'LOSS'} ({reason})",
-        description=(f"**Alert ID:** {t.id}\n**Side:** {t.side}\n**Entry:** ${t.entry_price:.2f}\n**Exit:** ${px:.2f}\n**P&L:** {pnl:+.2f}%\n**Original Score:** {t.score:.2f}/6.0".replace("**Original Score:** {trade.score:.2f}/6.0", f"**Original Score:** {trade.score:.2f}/6.0" if isinstance(trade.score, (int, float)) else "**Original Score:** —") ), color=color, timestamp=now)
-    emb.set_footer(text=f"CT: {ct} • UTC: {now.strftime('%Y-%m-%d %H:%M:%S UTC')}"); return emb
+# ---------------- Global Singletons ----------------
+md = MarketData(CFG.pair, CFG.interval)
+sheets = GoogleSheetsIntegration(CFG.sheets_webhook, CFG.sheets_token)
+tm = TradeManager(CFG, sheets)
+attach_metrics(tm)
 
-def build_error_embed(msg:str, cfg: Config)->discord.Embed:
-    now=utc_now(); ct=fmt_dt(now,cfg.tz_name)
-    emb=discord.Embed(title="⚠️ Error Alert", description=msg, color=0xFF9800, timestamp=now)
-    emb.set_footer(text=f"CT: {ct} • UTC: {now.strftime('%Y-%m-%d %H:%M:%S UTC')}"); return emb
+# ---------------- Scanner Loop ----------------
+_last_alert_time: Optional[datetime] = None
 
-def build_status_embed(cfg: Config, last_price: Optional[float], tm)->discord.Embed:
-    now=utc_now(); ct=fmt_dt(now,cfg.tz_name)
-    desc=(f"**Configuration:**\nProvider: **{cfg.provider.upper()}** (REST)\nScan: **{cfg.scan_every_seconds}s** | Min Score: **{cfg.min_signal_score}**\n"
-          f"Cooldown: **{cfg.alert_cooldown_minutes}m** | Expire: **{cfg.alert_expire_hours}h**\nRisk: **{cfg.position_risk_pct}%** | TP1/TP2: **{cfg.tp1_r_multiple}R/{cfg.tp2_r_multiple}R**\n\n")
-    if last_price: desc+=f"**Current Price:** ${last_price:.2f}\n"
-    desc+=f"**Active Alerts:** {len(tm.active)}\n"
-    emb=discord.Embed(title=f"🛰 Scout Tower Status (v{VERSION})", description=desc, color=0x00BCD4, timestamp=now)
-    emb.set_footer(text=f"CT: {ct} • UTC: {now.strftime('%Y-%m-%d %H:%M:%S UTC')}"); return emb
+@tasks.loop(seconds=1)
+async def _tick_status():
+    # status heartbeat in logs to show bot alive
+    if random.random() < 0.02:
+        log.info(f"Status: scan={CFG.scan_every_seconds}s min_score={CFG.min_score} cd={CFG.cooldown_minutes}m")
 
-mdp=MarketDataProvider(CFG); sheets=GoogleSheetsIntegration(CFG.sheets_webhook, CFG.sheets_token)
-tm=TradeManager(CFG, sheets); engine=EnhancedSignalEngine(CFG); dio=None
+@tasks.loop(seconds=5)
+async def scanner():
+    global _last_alert_time
+    try:
+        now = utc_now()
+        # rate control
+        if _last_alert_time and (now - _last_alert_time).total_seconds() < CFG.scan_every_seconds:
+            return
 
-intents = discord.Intents.default(); intents.message_content=True
-bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
-dio = None
+        df = await md.fetch_ohlc(limit=250)
+        if df is None or df.empty: return
+        df = df.rename(columns={"open":"open","high":"high","low":"low","close":"close","volume":"volume"})
+        df["open"] = df["open"].astype(float)
+        df["high"] = df["high"].astype(float)
+        df["low"]  = df["low"].astype(float)
+        df["close"]= df["close"].astype(float)
+        df["volume"]=df["volume"].astype(float)
+        df = add_indicators(df)
 
+        price_now = float(df["close"].iloc[-1])
+        sig = generate_signal(df, price_now)
+        if not sig: return
+
+        # cooldown per side simple guard
+        if _last_alert_time and (utc_now()-_last_alert_time).total_seconds() < CFG.cooldown_minutes*60:
+            return
+
+        t = await tm.open_trade(
+            side=sig["side"],
+            zone_lo=sig["zone"][0], zone_hi=sig["zone"][1],
+            sl=sig["sl"], tp1=sig["tp1"], tp2=sig["tp2"],
+            price_now=price_now
+        )
+        _last_alert_time = utc_now()
+
+        # Discord post
+        if CFG.signals_channel_id and not tm.muted:
+            ch = bot.get_channel(CFG.signals_channel_id)
+            if ch:
+                await ch.send(embed=embed_trade_open(t, price_now))
+
+    except Exception as e:
+        log.error(f"Scanner error: {e}")
+
+# ---------------- Discord Commands ----------------
 @bot.event
 async def on_ready():
-    global dio
-    dio = DiscordIO(CFG, bot)
-    log.info(f"Discord logged in as {bot.user} (v{VERSION})")
-    # Safe rehydrate
+    log.info(f"Discord logged in as {bot.user}")
+    if CFG.startup_channel_id:
+        ch = bot.get_channel(CFG.startup_channel_id)
+        if ch: await ch.send(f"🗼 Scout Tower v{VERSION} is online.")
+    _tick_status.start()
+    scanner.start()
+
+@bot.command(name="version")
+async def version_cmd(ctx):
+    await ctx.reply(f"Scout Tower v{VERSION} | scan={CFG.scan_every_seconds}s | min_score={CFG.min_score} | cd={CFG.cooldown_minutes}m")
+
+@bot.command(name="status")
+async def status_cmd(ctx):
+    snap = tm.snapshot_active()
+    lines = [f"{x['id']} {x['side']} zone:{x['zone']} SL:{x['sl']} TP1:{x['tp1']} TP2:{x['tp2']} opened:{x['opened']}" for x in snap]
+    text = "No active trades." if not lines else "\n".join(lines)
+    await ctx.reply(f"**Active**\n{text}")
+
+@bot.command(name="ping")
+async def ping_cmd(ctx):
+    await ctx.reply("Pong!")
+
+@bot.command(name="mute")
+async def mute_cmd(ctx):
+    tm.muted = True
+    await ctx.reply("Alerts muted.")
+
+@bot.command(name="unmute")
+async def unmute_cmd(ctx):
+    tm.muted = False
+    await ctx.reply("Alerts unmuted.")
+
+@bot.command(name="active")
+async def active_cmd(ctx):
+    snap = tm.snapshot_active()
+    if not snap:
+        return await ctx.reply("No active trades.")
+    await ctx.reply("\n".join([json.dumps(x) for x in snap]))
+
+@bot.command(name="close")
+async def close_cmd(ctx, trade_id: str, price: Optional[float] = None):
     try:
-        await tm.rehydrate()
-    except AttributeError:
-        log.warning("rehydrate_open_trades not available; skipping rehydrate")
-    except Exception as e:
-        log.warning(f"rehydrate error: {e}")
-    if not scanner.is_running(): scanner.start()
-    if not daily_summary.is_running(): daily_summary.start()
-    if not expiry_checker.is_running(): expiry_checker.start()
+        price = float(price) if price is not None else None
+    except Exception:
+        price = None
+    if not price:
+        return await ctx.reply("Usage: !close <id> <price>")
+    ok = await tm.close_trade(trade_id, price, reason="manual")
+    await ctx.reply("Closed." if ok else "Trade not found.")
+
+@bot.command(name="result")
+async def cmd_result(ctx, trade_id: str, price: float, *, notes: str = ""):
+    ok = await tm.close_trade(trade_id, float(price), reason=f"manual: {notes or ''}")
+    await ctx.reply("Logged." if ok else "Trade not found.")
+
+# ---- Mode Commands ----
+@bot.command(name="mode")
+async def cmd_mode(ctx, *, level: str = None):
+    if not level:
+        s = current_mode_snapshot()
+        return await ctx.reply(f"Current mode → scan:{s['scan']}s | min_score:{s['min_score']} | cooldown:{s['cooldown']}m")
     try:
-        await dio.safe_send(CFG.startup_channel_id, embed=build_status_embed(CFG, None, tm))
-    except Exception as e:
-        log.warning(f"startup send error: {e}")
-
-scanner_paused=False; _last_price=None
-
-@tasks.loop(seconds=CFG.scan_every_seconds)
-async def scanner():
-    global _last_price
-    if scanner_paused: return
-    try:
-        df = await mdp.fetch_ohlc_interval(CFG.fast_interval, limit=200)
-        df_htf = await mdp.fetch_ohlc_interval(CFG.htf_interval, limit=200)
-        if df is None or df.empty or df_htf is None or df_htf.empty: return
-        df = add_indicators(df); df_htf = add_indicators(df_htf); latest=df.iloc[-1]; _last_price=float(latest["close"])
-        for info in await tm.check_alert_exits(_last_price):
-            await dio.safe_send(CFG.signals_channel_id, embed=build_exit_embed(info, CFG))
-        sig = engine.generate(df, df_htf)
-        if not sig: return
-        if tm.on_cooldown(sig.side.upper()): return
-        trade_id=f"ETH-{int(time.time())}"
-        t=TradeData(id=trade_id, pair="ETH/USDT", side=sig.side.upper(), entry_price=float(sig.entry),
-                    stop_loss=float(sig.stop), take_profit_1=float(sig.tp1), take_profit_2=float(sig.tp2),
-                    confidence="Confluence", knight="Sir Leonis" if sig.side.upper()=="LONG" else "Sir Lucien",
-                    score=sig.score, level_name=sig.reason, market_context=sig.market_context)
-        setattr(t,"entry_low",sig.entry_low); setattr(t,"entry_high",sig.entry_high); setattr(t,"entry_label",sig.entry_label)
-        await tm.open_trade(t)
-        await dio.safe_send(CFG.signals_channel_id, embed=build_trade_embed(t, CFG))
-        tm.set_cooldown(sig.side.upper())
-    except Exception as e:
-        await dio.safe_send(CFG.errors_channel_id, embed=build_error_embed(f"Scanner error: {e}", CFG))
-
-@tasks.loop(hours=24)
-async def daily_summary():
-    try:
-        await dio.safe_send(CFG.status_channel_id, embed=build_status_embed(CFG, _last_price, tm))
-    except Exception as e:
-        log.error(f"Daily summary error: {e}")
-
-@tasks.loop(hours=1)
-async def expiry_checker():
-    try:
-        # here you could expire old alerts if desired
-        pass
-    except Exception as e:
-        log.error(f"Expiry checker error: {e}")
-
-# ---------------- Commands ----------------
-@bot.command()
-async def version(ctx): await ctx.reply(f"Scout Tower v{VERSION}")
-
-@bot.command()
-async def status(ctx): await ctx.send(embed=build_status_embed(CFG, _last_price, tm))
-
-@bot.command()
-async def testsheets(ctx):
-    try:
-        test_trade = TradeData(
-            id=f"TEST-{int(time.time())}", pair="ETH/USDT", side="TEST",
-            entry_price=9999.99, stop_loss=9900.00, take_profit_1=10050.00, take_profit_2=10100.00,
-            confidence="Connection Test", score=0.0, level_name="Testing Google Sheets Integration"
-        )
-        # add entry zone attributes
-        setattr(test_trade, "entry_low", 9995.00)
-        setattr(test_trade, "entry_high", 10005.00)
-        res = await sheets.write_entry(test_trade)
-        await ctx.reply(f"Sheets POST result (status={res.get('http_status','?')}):\n```{res}```")
-    except Exception as e:
-        await ctx.reply(f"❌ Sheets test error:\n```{e}```")
-
-@bot.command()
-async def checksheets(ctx):
-    masked = CFG.sheets_webhook[:40] + "..." if len(CFG.sheets_webhook) > 40 else CFG.sheets_webhook
-    token_state = "set ✅" if CFG.sheets_token else "empty ❌"
-    try:
-        res = await sheets._get({"action":"open"})
-    except Exception as e:
-        res = {"status":"error","message":str(e)}
-    await ctx.reply(
-        "**Sheets Config**\n"
-        f"Webhook: `{masked}`\n"
-        f"Token: {token_state}\n"
-        f"Open-trades GET: ```{json.dumps(res)[:400]}```"
-    )
-
-@bot.command()
-async def rehydrate(ctx):
-    try:
-        count = await tm.rehydrate()
-        await ctx.reply(f"Rehydrated **{count}** open alerts from Sheets.")
-    except Exception as e:
-        await ctx.reply(f"❌ Rehydrate error: {e}")
-
-@bot.command()
-async def getcsv(ctx, filename: str = "alerts"):
-    try:
-        if filename not in ["alerts","fills","decisions"]:
-            await ctx.reply("Valid options: alerts, fills, decisions"); return
-        p = DATA_DIR / f"{filename}.csv"
-        if not p.exists(): await ctx.reply(f"No {filename}.csv file found"); return
-        with open(p,'rb') as f:
-            await ctx.reply(file=discord.File(f, filename=f"{filename}_{utc_now().strftime('%Y%m%d_%H%M%S')}.csv"))
+        applied = await apply_preset(level)
+        await ctx.reply(f"Mode set → {applied['mode']} | scan:{applied['scan']}s | min_score:{applied['min_score']} | cooldown:{applied['cooldown']}m")
     except Exception as e:
         await ctx.reply(f"Error: {e}")
 
-@bot.command()
-async def pushtosheet(ctx, trade_id: str):
-    t = tm.active.get(trade_id)
-    if not t: await ctx.reply(f"Alert {trade_id} not found in active alerts"); return
-    res = await sheets.write_entry_with_retry(t)
-    await ctx.reply(f"Push result: ```{res}```")
+@bot.command(name="showmode")
+async def cmd_showmode(ctx):
+    s = current_mode_snapshot()
+    await ctx.reply(f"scan:{s['scan']}s | min_score:{s['min_score']} | cooldown:{s['cooldown']}m")
 
-# -------------- Flask health --------------
-from flask import Flask, jsonify
+# ---- CSV/Stats Commands ----
+def _tail_csv(path: Path, n: int = 10) -> List[dict]:
+    if not path.exists(): return []
+    rows = list(csv.DictReader(path.open()))
+    return rows[-n:]
+
+@bot.command(name="stats")
+async def stats_cmd(ctx):
+    s = tm.metrics.stats() if tm.metrics else {}
+    await ctx.reply(json.dumps(s, indent=2))
+
+@bot.command(name="csvstats")
+async def csvstats_cmd(ctx):
+    def _fmt(path: Path):
+        return f"{path.name}: {'exists' if path.exists() else 'missing'} {path.stat().st_size if path.exists() else 0} bytes"
+    await ctx.reply("\n".join([_fmt(ALERTS_CSV), _fmt(DECISIONS_CSV), _fmt(FILLS_CSV)]))
+
+@bot.command(name="lastalerts")
+async def lastalerts_cmd(ctx, n: int = 5):
+    rows = _tail_csv(ALERTS_CSV, n)
+    if not rows: return await ctx.reply("No alerts yet.")
+    await ctx.reply("\n".join([json.dumps(r) for r in rows]))
+
+@bot.command(name="lastfills")
+async def lastfills_cmd(ctx, n: int = 5):
+    rows = _tail_csv(FILLS_CSV, n)
+    if not rows: return await ctx.reply("No fills yet.")
+    await ctx.reply("\n".join([json.dumps(r) for r in rows]))
+
+@bot.command(name="exportday")
+async def exportday_cmd(ctx, day: str = "today"):
+    if not FILLS_CSV.exists(): return await ctx.reply("No fills.csv")
+    day0 = utc_now().strftime("%Y-%m-%d") if day=="today" else day
+    out = [r for r in csv.DictReader(FILLS_CSV.open()) if str(r.get("time","")).startswith(day0)]
+    if not out: return await ctx.reply(f"No fills for {day0}")
+    # attach as file
+    buf = io.StringIO()
+    w = csv.DictWriter(buf, fieldnames=list(out[0].keys()))
+    w.writeheader()
+    w.writerows(out)
+    buf.seek(0)
+    await ctx.reply(file=discord.File(fp=io.BytesIO(buf.read().encode()), filename=f"fills_{day0}.csv"))
+
+# ---- Sheets Utility Commands (stubs preserved) ----
+@bot.command(name="testsheets")
+async def testsheets_cmd(ctx):
+    ok = await sheets.post({"action":"test", "time": ts()})
+    await ctx.reply("Sheets ok" if ok else "Sheets failed")
+
+@bot.command(name="checksheets")
+async def checksheets_cmd(ctx):
+    await ctx.reply("Webhook set" if CFG.sheets_webhook else "No webhook configured")
+
+@bot.command(name="rehydrate")
+async def rehydrate_cmd(ctx):
+    rows = await sheets.rehydrate_open_trades()
+    await ctx.reply(f"rehydrate: {len(rows)} rows")
+
+@bot.command(name="getcsv")
+async def getcsv_cmd(ctx):
+    if not ALERTS_CSV.exists(): return await ctx.reply("No alerts.csv yet")
+    await ctx.reply(file=discord.File(str(ALERTS_CSV)))
+
+@bot.command(name="pushtosheet")
+async def pushtosheet_cmd(ctx):
+    if not ALERTS_CSV.exists(): return await ctx.reply("No alerts.csv")
+    rows = list(csv.DictReader(ALERTS_CSV.open()))
+    ok = True
+    for r in rows[-10:]:
+        ok = ok and await sheets.post({"action":"entry", **r})
+    await ctx.reply("Pushed last 10 alerts." if ok else "Push encountered errors.")
+
+@bot.command(name="sheetping")
+async def sheetping_cmd(ctx):
+    ok = await sheets.post({"action":"ping","time":ts()})
+    await ctx.reply("pong" if ok else "no pong")
+
+# ---- Help ----
+@bot.command(name="help")
+async def help_command(ctx):
+    cmds = [
+        "!version, !status, !ping, !mute, !unmute",
+        "!mode <testing|level1|level2|level3>, !showmode",
+        "!active, !close <id> <price>, !result <id> <price> [notes]",
+        "!stats, !csvstats, !lastalerts [n], !lastfills [n], !exportday [YYYY-MM-DD|today]",
+        "!testsheets, !checksheets, !rehydrate, !getcsv, !pushtosheet, !sheetping",
+    ]
+    await ctx.reply("\n".join(cmds))
+
+# ---------------- Flask Health/Metrics ----------------
 app = Flask(__name__)
-@app.route("/")
-def root():
-    return jsonify({"ok":True,"version":VERSION,"time":utc_now().isoformat(),"active_alerts":len(tm.active)})
+
+@app.get("/health")
+def _health():
+    return jsonify({
+        "ok": True,
+        "name": f"Scout Tower v{VERSION}",
+        "time_utc": utc_now().strftime("%Y-%m-%d %H:%M:%S"),
+        "scanner_running": scanner.is_running(),
+        "scan": CFG.scan_every_seconds,
+        "min_score": CFG.min_score,
+        "cooldown": CFG.cooldown_minutes
+    })
+
+@app.get("/metrics")
+def _metrics():
+    s = tm.metrics.stats() if tm.metrics else {}
+    return jsonify({"ok": True, "metrics": s})
+
 def run_flask():
-    app.run(host="0.0.0.0", port=CFG.port, debug=False, use_reloader=False)
+    app.run(host="0.0.0.0", port=CFG.port, debug=False)
 
-async def cleanup():
-    await session_mgr.close()
-    if scanner.is_running(): scanner.stop()
-    if daily_summary.is_running(): daily_summary.stop()
-    if expiry_checker.is_running(): expiry_checker.stop()
-
+# ---------------- Main ----------------
 def main():
     threading.Thread(target=run_flask, daemon=True).start()
-    try: bot.run(CFG.token)
-    except KeyboardInterrupt: asyncio.run(cleanup())
+    token = CFG.token
+    if not token:
+        log.error("DISCORD_TOKEN missing.")
+        return
+    bot.run(token)
 
 if __name__ == "__main__":
     main()
-
-
-@bot.command(name="sheetping")
-async def sheetping(ctx):
-    """Round-trip Sheets health check: POST + GET"""
-    try:
-        now_ts = int(time.time())
-        dummy_id = f"PING-{now_ts}"
-        t = TradeData(
-            id=dummy_id, pair="ETH/USDT", side="TEST",
-            entry_price=1234.56, stop_loss=1230.00,
-            take_profit_1=1240.00, take_profit_2=1245.00,
-            status="OPEN", timestamp=utc_now().isoformat()
-        )
-        t.entry_low = 1233.00
-        t.entry_high = 1236.00
-        res = await sheets.write_entry_with_retry(t)
-        try:
-            rows = []
-            if hasattr(sheets, "rehydrate_open_trades"):
-                rows = await sheets.rehydrate_open_trades()
-            else:
-                data = await sheets._get({"action":"open"})
-                rows = data.get("trades", []) or data.get("rows", []) or data.get("data", []) or []
-            found = False
-            for r in rows:
-                if isinstance(r, TradeData):
-                    if r.id == dummy_id:
-                        found=True
-                        break
-                elif isinstance(r, dict):
-                    keys = { (str(k) if k is not None else '').strip().lower(): v for k, v in r.items() }
-                    rid = str(keys.get("trade id") or keys.get("trade_id") or "")
-                    if rid == dummy_id:
-                        found=True
-                        break
-            await ctx.reply(f"✅ Sheets ping OK — posted `{dummy_id}`; found={found}. HTTP={res.get('http_status','?')} payload={res}")
-        except Exception as inner:
-            await ctx.reply(f"⚠️ Posted `{dummy_id}` but GET failed: `{inner}` (POST payload={res})")
-    except Exception as e:
-        await ctx.reply(f"❌ Sheets ping failed: `{e}`")
-
-
-@bot.command(name="sheetfix")
-async def sheetfix(ctx):
-    """Rewrite header row via Apps Script ensureHeaders (no row append)."""
-    try:
-        payload = {"action": "update", "id": "__sheetfix__"}
-        if sheets.token:
-            payload["token"] = sheets.token
-        _ = await sheets._post(payload)
-        data = await sheets._get({"action":"open"})
-        trades = data.get("trades", []) or data.get("rows", []) or data.get("data", []) or []
-        headers = list(trades[0].keys()) if trades else []
-        expected = ['Trade ID','Asset','Direction','Entry Price','Entry Low','Entry High','Stop Loss','Take Profit 1','Take Profit 2','Status','Exit Price','Exit Reason','PnL %','Timestamp','Level Name','Level Price','Confidence','Knight','Original Score']
-        ok = headers[:len(expected)] == expected[:len(headers)] if headers else False
-        await ctx.reply("✅ Header check complete.\n"
-                        f"**Expected:** {expected}\n"
-                        f"**Current:**  {headers or '— (no rows returned; headers likely set but sheet is empty)'}\n"
-                        f"Result: {'OK' if ok else 'Mismatch — headers were updated, but confirm in Sheet.'}")
-    except Exception as e:
-        await ctx.reply(f"❌ sheetfix failed: `{e}`")
