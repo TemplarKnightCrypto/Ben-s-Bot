@@ -702,9 +702,7 @@ async def posttest(ctx):
         level_name="Test embed"
     )
     emb = build_trade_embed(t, CFG)
-    await dio.safe_send(CFG.signals_channel_id,
-        title=emb.title, description=emb.description,
-        color=emb.color, timestamp=emb.timestamp)
+    await dio.safe_send(CFG.signals_channel_id, embed_obj=emb)
     await ctx.reply(f"Posted a test embed to channel {CFG.signals_channel_id}. If you don't see it, check bot permissions.")
 
 @bot.command(name="mode")
@@ -757,7 +755,7 @@ async def on_ready():
     # Startup notice
     try:
         emb = build_startup_embed(CFG, open_count=len(tm.active))
-        await dio.safe_send(CFG.startup_channel_id, title=emb.title, description=emb.description, color=emb.color, timestamp=emb.timestamp)
+        await dio.safe_send(CFG.startup_channel_id, embed_obj=emb)
     except Exception as e:
         log.warning(f"startup embed error: {e}")
 
@@ -800,21 +798,21 @@ async def scanner():
 
         # Send embed
         emb = build_trade_embed(t, CFG)
-        await dio.safe_send(CFG.signals_channel_id, title=emb.title, description=emb.description, color=emb.color, timestamp=emb.timestamp)
+        await dio.safe_send(CFG.signals_channel_id, embed_obj=emb)
         # Cooldown set
         tm.set_cooldown(sig.side.upper())
 
     except Exception as e:
         log.error(f"scanner error: {e}")
         emb = build_error_embed(f"Scanner error: {e}", CFG)
-        await dio.safe_send(CFG.errors_channel_id, title=emb.title, description=emb.description, color=emb.color, timestamp=emb.timestamp)
+        await dio.safe_send(CFG.errors_channel_id, embed_obj=emb)
 
 # -------------- Daily Summary -----------------
 @tasks.loop(hours=24)
 async def daily_summary():
     try:
         emb = build_status_embed(CFG, provider_ok=True, last_price=_last_price)
-        await dio.safe_send(CFG.status_channel_id, title=emb.title, description=emb.description, color=emb.color, timestamp=emb.timestamp)
+        await dio.safe_send(CFG.status_channel_id, embed_obj=emb)
     except Exception as e:
         log.error(f"daily_summary error: {e}")
 
