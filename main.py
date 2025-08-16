@@ -13,7 +13,6 @@ import os, sys, csv, json, math, time, asyncio, logging, random, threading, io
 from dataclasses import dataclass, field, asdict
 from typing import Optional, Dict, Any, List, Tuple
 from datetime import datetime, timezone, timedelta
-from pathlib import Path
 
 import aiohttp
 import numpy as np
@@ -99,7 +98,7 @@ CFG = Config()
 # ---------------- Discord ----------------
 intents = discord.Intents.default()
 intents.message_content = True
-bot = commands.Bot(command_prefix="!", intents=intents)
+bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 
 # ---------------- Indicator Utils ----------------
 def ema(series: pd.Series, n: int) -> pd.Series:
