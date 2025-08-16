@@ -310,7 +310,9 @@ class TradeManager:
         self.active[t.id]=t; append_csv(ALERTS_CSV, {**asdict(t), "opened_at": utc_now().isoformat()})
         await self.sheets.write_entry_with_retry(t)
     async def close_trade(self, trade_id: str, exit_price: float, reason:str):
-        t=self.active.get(trade_id); if not t: return None
+        t = self.active.get(trade_id)
+        if not t:
+            return None
         pnl=self.calculate_pnl(t, exit_price)
         await self.sheets.update_exit(trade_id, exit_price, reason, pnl)
         append_csv(FILLS_CSV, {"id":trade_id,"exit_price":exit_price,"reason":reason,"pnl_pct":pnl,"score":t.score,"time":utc_now().isoformat()})
