@@ -113,12 +113,12 @@ def rsi(series: pd.Series, n: int = 14) -> pd.Series:
     roll_dn = pd.Series(dn, index=series.index).rolling(n).mean()
     rs = roll_up / (roll_dn.replace(0, np.nan))
     out = 100.0 - (100.0/(1.0+rs))
-    return out.fillna(method="bfill").fillna(50.0)
+    return out.bfill().fillna(50.0)
 
 def atr(df: pd.DataFrame, n: int = 14) -> pd.Series:
     h, l, c = df["high"], df["low"], df["close"]
     tr = np.maximum(h - l, np.maximum(abs(h - c.shift(1)), abs(l - c.shift(1))))
-    return pd.Series(tr).rolling(n).mean().fillna(method="bfill")
+    return pd.Series(tr).rolling(n).mean().bfill()
 
 def vwap(df: pd.DataFrame) -> pd.Series:
     pv = (df["close"] * df["volume"]).cumsum()
