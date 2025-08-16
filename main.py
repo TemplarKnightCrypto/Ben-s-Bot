@@ -1,5 +1,5 @@
 # ===============================================
-# Scout Tower - Enhanced ETH Alert Bot (v3.3.14 MERGED)
+# Scout Tower - Enhanced ETH Alert Bot (v3.3.15 MERGED)
 # - Engine: Donchian breakout + EMA trend + RSI/VWAP/ATR filters
 # - Zones: Entry band, SL/TP from ATR + structure
 # - Providers: Binance primary, Kraken fallback
@@ -13,6 +13,7 @@ import os, sys, csv, json, math, time, asyncio, logging, random, threading, io
 from dataclasses import dataclass, field, asdict
 from typing import Optional, Dict, Any, List, Tuple
 from datetime import datetime, timezone, timedelta
+from pathlib import Path
 
 import aiohttp
 import numpy as np
@@ -23,7 +24,7 @@ from discord.ext import tasks, commands
 
 from flask import Flask, jsonify
 
-VERSION = "3.3.14"
+VERSION = "3.3.15"
 
 # ---------------- Logging ----------------
 logging.basicConfig(
