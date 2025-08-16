@@ -1,5 +1,5 @@
 # ===============================================
-# Scout Tower - Enhanced ETH Alert Bot (v3.3.9, Zones)
+# Scout Tower - Enhanced ETH Alert Bot (v3.3.10, Zones)
 # - Adds commands: !checksheets, !rehydrate, !version
 # - Keeps entry ZONES, percent SL/TP, no position-size by default
 # ===============================================
@@ -16,7 +16,7 @@ from discord.ext import tasks, commands
 from flask import Flask, jsonify
 import threading
 
-VERSION = "3.3.9"
+VERSION = "3.3.10"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -618,7 +618,13 @@ async def on_ready():
     global dio
     dio = DiscordIO(CFG, bot)
     log.info(f"Discord logged in as {bot.user} (v{VERSION})")
-    await tm.rehydrate()
+    # Safe rehydrate
+    try:
+        await tm.rehydrate()
+    except AttributeError:
+        log.warning("rehydrate_open_trades not available; skipping rehydrate")
+    except Exception as e:
+        log.warning(f"rehydrate error: {e}")
     if not scanner.is_running(): scanner.start()
     if not daily_summary.is_running(): daily_summary.start()
     if not expiry_checker.is_running(): expiry_checker.start()
