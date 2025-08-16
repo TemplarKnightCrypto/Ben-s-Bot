@@ -1,5 +1,5 @@
 # ===============================================
-# Scout Tower - Enhanced ETH Alert Bot (v3.0)
+# Scout Tower - Enhanced ETH Alert Bot (v3.2)
 # Feature-rich alert system with auto-close functionality
 # -----------------------------------------------
 # NEW FEATURES:
@@ -437,9 +437,22 @@ class GoogleSheetsIntegration:
             log.error(f"Sheets GET error: {e}")
             return {"status":"error","message":str(e)}
 
-    async def write_entry(self, t: TradeData) -> Dict[str, Any]:
-        payload = asdict(t)
-        return await self._post(payload)
+    async def write_entry_with_retry(self, t: TradeData, max_retries: int = 3) -> Dict[str, Any]:
+        """Write entry with retry logic"""
+        for attempt in range(max_retries):
+            try:
+                result = await self.write_entry(t)
+                if result.get("status") != "error":
+                    return result
+                log.warning(f"Sheets write attempt {attempt + 1} failed: {result}")
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(2 ** attempt)  # Exponential backoff
+            except Exception as e:
+                log.error(f"Sheets write attempt {attempt + 1} exception: {e}")
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(2 ** attempt)
+        
+        return {"status": "error", "message": f"Failed after {max_retries} attempts"}
 
     async def update_exit(self, trade_id: str, exit_price: float, exit_reason: str, pnl_pct: float) -> Dict[str, Any]:
         payload = {
@@ -511,8 +524,19 @@ class TradeManager:
         self.active[t.id] = t
         # CSV log
         append_csv(ALERTS_CSV, {**asdict(t), "opened_at": utc_now().isoformat()})
-        # Sheets
-        await self.sheets.write_entry(t)
+        # Sheets - with retry and error handling
+        try:
+            result = await self.sheets.write_entry_with_retry(t)
+            if result.get("status") == "error":
+                log.error(f"Failed to write to Sheets after retries: {result}")
+                # Send error notification
+                error_msg = f"⚠️ Google Sheets write failed for {t.id}: {result.get('message', 'Unknown error')}"
+                await dio.safe_send(CFG.errors_channel_id, 
+                                  embed=build_error_embed(error_msg, CFG))
+        except Exception as e:
+            log.error(f"Exception writing to Sheets: {e}")
+            await dio.safe_send(CFG.errors_channel_id,
+                              embed=build_error_embed(f"Sheets exception for {t.id}: {str(e)[:200]}", CFG))
 
     async def close_trade(self, trade_id: str, exit_price: float, reason: str) -> Optional[float]:
         """Close a trade and return PnL%"""
@@ -1172,25 +1196,238 @@ async def unmute(ctx):
     await ctx.reply("🔊 Alerts resumed.")
 
 @bot.command()
-async def posttest(ctx):
-    """Send a test embed to signals channel"""
-    t = TradeData(
-        id="TEST-123",
-        pair="ETH/USDT",
-        side="LONG",
-        entry_price=2000,
-        stop_loss=1950,
-        take_profit_1=2030,
-        take_profit_2=2060,
-        confidence="Test Alert",
-        knight="Sir Leonis",
-        score=5.0,
-        level_name="**This is a test alert**\nUsed to verify Discord permissions.",
-        market_context="📈 Uptrend | ✅ Above VWAP | ⚖️ Normal Volatility"
-    )
-    emb = build_trade_embed(t, CFG)
-    await dio.safe_send(CFG.signals_channel_id, embed_obj=emb)
-    await ctx.reply(f"Test alert posted to channel {CFG.signals_channel_id}")
+async def testsheets(ctx):
+    """Test Google Sheets connection"""
+    try:
+        # Create test trade
+        test_trade = TradeData(
+            id=f"TEST-{int(time.time())}",
+            pair="ETH/USDT",
+            side="TEST",
+            entry_price=9999.99,
+            stop_loss=9900.00,
+            take_profit_1=10050.00,
+            take_profit_2=10100.00,
+            confidence="Connection Test",
+            score=0.0,
+            level_name="Testing Google Sheets Integration"
+        )
+        
+        # Try to write
+        result = await sheets.write_entry(test_trade)
+        
+        if result.get("status") == "error":
+            await ctx.reply(f"❌ Sheets test failed:\n```{result}```")
+        else:
+            await ctx.reply(f"✅ Sheets test successful:\n```{result}```")
+            # Clean up test entry if possible
+            await sheets.update_exit(test_trade.id, 9999.99, "Test Complete", 0)
+    except Exception as e:
+        await ctx.reply(f"❌ Sheets test error:\n```{e}```")
+
+@bot.command()
+async def pushtosheet(ctx, trade_id: str):
+    """Manually push an alert to Google Sheets: !pushtosheet ETH-1755376345"""
+    if trade_id not in tm.active:
+        await ctx.reply(f"Alert {trade_id} not found in active alerts")
+        return
+    
+    try:
+        trade = tm.active[trade_id]
+        result = await sheets.write_entry_with_retry(trade)
+        
+        if result.get("status") == "error":
+            await ctx.reply(f"❌ Failed to push {trade_id} to Sheets: {result.get('message')}")
+        else:
+            await ctx.reply(f"✅ Successfully pushed {trade_id} to Sheets")
+    except Exception as e:
+        await ctx.reply(f"❌ Error pushing to Sheets: {e}")
+
+@bot.command()
+async def getcsv(ctx, filename: str = "alerts"):
+    """Download CSV file: !getcsv alerts OR !getcsv fills"""
+    try:
+        # Validate filename
+        if filename not in ["alerts", "fills", "decisions"]:
+            await ctx.reply("Valid options: alerts, fills, decisions")
+            return
+        
+        csv_path = DATA_DIR / f"{filename}.csv"
+        
+        if not csv_path.exists():
+            await ctx.reply(f"No {filename}.csv file found")
+            return
+        
+        # Check file size (Discord limit is 8MB)
+        file_size = csv_path.stat().st_size
+        if file_size > 8 * 1024 * 1024:
+            await ctx.reply(f"File too large ({file_size / 1024 / 1024:.2f}MB). Discord limit is 8MB.")
+            return
+        
+        # Send file
+        with open(csv_path, 'rb') as f:
+            file = discord.File(f, filename=f"{filename}_{utc_now().strftime('%Y%m%d_%H%M%S')}.csv")
+            await ctx.reply(f"Here's your {filename} CSV:", file=file)
+            
+    except Exception as e:
+        await ctx.reply(f"Error getting CSV: {e}")
+
+@bot.command()
+async def csvstats(ctx):
+    """Show CSV file statistics"""
+    try:
+        stats = []
+        
+        for filename in ["alerts", "fills", "decisions"]:
+            csv_path = DATA_DIR / f"{filename}.csv"
+            if csv_path.exists():
+                size = csv_path.stat().st_size
+                lines = 0
+                with open(csv_path, 'r') as f:
+                    lines = sum(1 for _ in f) - 1  # Subtract header
+                
+                stats.append(f"**{filename}.csv**: {lines} rows, {size/1024:.2f}KB")
+            else:
+                stats.append(f"**{filename}.csv**: Not found")
+        
+        await ctx.reply("📊 **CSV File Stats:**\n" + "\n".join(stats))
+        
+    except Exception as e:
+        await ctx.reply(f"Error getting stats: {e}")
+
+@bot.command()
+async def lastalerts(ctx, count: int = 5):
+    """Show last N alerts from CSV: !lastalerts 10"""
+    try:
+        if not ALERTS_CSV.exists():
+            await ctx.reply("No alerts.csv file found")
+            return
+        
+        # Read CSV
+        import csv as csv_module
+        alerts = []
+        with open(ALERTS_CSV, 'r') as f:
+            reader = csv_module.DictReader(f)
+            alerts = list(reader)
+        
+        if not alerts:
+            await ctx.reply("No alerts in CSV")
+            return
+        
+        # Get last N alerts
+        count = min(count, 20)  # Limit to 20 for Discord message size
+        last_alerts = alerts[-count:]
+        
+        # Format output
+        output = "**Last {} Alerts:**\n```\n".format(min(count, len(alerts)))
+        for alert in last_alerts:
+            output += f"{alert.get('id', 'N/A')} | {alert.get('side', 'N/A')} | "
+            output += f"${alert.get('entry_price', 'N/A')} | Score: {alert.get('score', 'N/A')}\n"
+        output += "```"
+        
+        await ctx.reply(output)
+        
+    except Exception as e:
+        await ctx.reply(f"Error reading alerts: {e}")
+
+@bot.command()
+async def lastfills(ctx, count: int = 5):
+    """Show last N filled/closed alerts: !lastfills 10"""
+    try:
+        if not FILLS_CSV.exists():
+            await ctx.reply("No fills.csv file found")
+            return
+        
+        # Read CSV
+        import csv as csv_module
+        fills = []
+        with open(FILLS_CSV, 'r') as f:
+            reader = csv_module.DictReader(f)
+            fills = list(reader)
+        
+        if not fills:
+            await ctx.reply("No fills in CSV")
+            return
+        
+        # Get last N fills
+        count = min(count, 20)
+        last_fills = fills[-count:]
+        
+        # Format output
+        output = "**Last {} Fills:**\n```\n".format(min(count, len(fills)))
+        for fill in last_fills:
+            pnl = float(fill.get('pnl_pct', 0))
+            emoji = "✅" if pnl > 0 else "❌"
+            output += f"{emoji} {fill.get('id', 'N/A')} | "
+            output += f"P&L: {pnl:+.2f}% | {fill.get('reason', 'N/A')}\n"
+        output += "```"
+        
+        # Calculate summary stats
+        all_pnls = [float(f.get('pnl_pct', 0)) for f in fills]
+        wins = sum(1 for p in all_pnls if p > 0)
+        total_pnl = sum(all_pnls)
+        
+        output += f"\n**Summary:** {wins}/{len(fills)} wins ({wins/len(fills)*100:.1f}%), Total: {total_pnl:+.2f}%"
+        
+        await ctx.reply(output)
+        
+    except Exception as e:
+        await ctx.reply(f"Error reading fills: {e}")
+
+@bot.command()
+async def exportday(ctx, date: str = None):
+    """Export alerts for specific day: !exportday 2024-08-16 or !exportday today"""
+    try:
+        # Parse date
+        if date is None or date.lower() == "today":
+            target_date = utc_now().date()
+        else:
+            from datetime import datetime
+            target_date = datetime.strptime(date, "%Y-%m-%d").date()
+        
+        if not ALERTS_CSV.exists():
+            await ctx.reply("No alerts.csv file found")
+            return
+        
+        # Read and filter alerts
+        import csv as csv_module
+        filtered_alerts = []
+        with open(ALERTS_CSV, 'r') as f:
+            reader = csv_module.DictReader(f)
+            for row in reader:
+                try:
+                    alert_time = datetime.fromisoformat(row.get('opened_at', row.get('timestamp', '')).replace('Z', '+00:00'))
+                    if alert_time.date() == target_date:
+                        filtered_alerts.append(row)
+                except:
+                    continue
+        
+        if not filtered_alerts:
+            await ctx.reply(f"No alerts found for {target_date}")
+            return
+        
+        # Create temporary CSV
+        import tempfile
+        import csv as csv_module
+        
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.csv', delete=False, newline='') as tmp:
+            if filtered_alerts:
+                writer = csv_module.DictWriter(tmp, fieldnames=filtered_alerts[0].keys())
+                writer.writeheader()
+                writer.writerows(filtered_alerts)
+                tmp_path = tmp.name
+        
+        # Send file
+        with open(tmp_path, 'rb') as f:
+            file = discord.File(f, filename=f"alerts_{target_date}.csv")
+            await ctx.reply(f"Found {len(filtered_alerts)} alerts for {target_date}:", file=file)
+        
+        # Clean up
+        import os
+        os.unlink(tmp_path)
+        
+    except Exception as e:
+        await ctx.reply(f"Error exporting: {e}")
 
 @bot.command(name="mode")
 async def set_mode(ctx, *, level: str):
