@@ -1,5 +1,5 @@
 # ===============================================
-# Scout Tower - Enhanced ETH Alert Bot (v3.3.10, Zones)
+# Scout Tower - Enhanced ETH Alert Bot (v3.3.11, Zones)
 # - Adds commands: !checksheets, !rehydrate, !version
 # - Keeps entry ZONES, percent SL/TP, no position-size by default
 # ===============================================
@@ -16,7 +16,7 @@ from discord.ext import tasks, commands
 from flask import Flask, jsonify
 import threading
 
-VERSION = "3.3.10"
+VERSION = "3.3.11"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -352,46 +352,6 @@ class GoogleSheetsIntegration:
     async def update_exit(self, trade_id: str, exit_price: float, exit_reason: str, pnl_pct: float):
         return await self._post({"action":"update","id":trade_id,"exit_price":exit_price,"exit_reason":exit_reason,"pnl_pct":pnl_pct,"status":"CLOSED"})
     
-async def rehydrate_open_trades(self) -> List[TradeData]:
-        data = await self._get({"action":"open"})
-        rows = data.get("trades", []) or data.get("rows", []) or data.get("data", []) or []
-        out: List[TradeData] = []
-        for r in rows:
-            try:
-                norm = self._normalize_keys(r)
-                # Only OPEN rows
-                if str(norm.get("status","")).strip().upper() != "OPEN":
-                    continue
-                t = TradeData(
-                    id=str(norm.get("trade_id","")) or str(norm.get("id","")),
-                    pair=str(norm.get("asset","ETH/USDT")),
-                    side=str(norm.get("side","LONG")).upper().capitalize(),
-                    entry_price=self._to_float(norm.get("entry_price"), 0),
-                    stop_loss=self._to_float(norm.get("stop_loss"), 0),
-                    take_profit_1=self._to_float(norm.get("take_profit_1"), 0),
-                    take_profit_2=self._to_float(norm.get("take_profit_2"), 0),
-                    status=str(norm.get("status","OPEN")),
-                    timestamp=str(norm.get("timestamp", utc_now().isoformat())),
-                    level_name=norm.get("level_name"),
-                    level_price=self._to_float(norm.get("level_price")) if norm.get("level_price") not in (None, "") else None,
-                    confidence=str(norm.get("confidence","")) if norm.get("confidence") not in (None, "") else None,
-                    knight=str(norm.get("knight") or "Sir Leonis"),
-                    score=self._to_float(norm.get("score")) if norm.get("score") not in (None, "") else None,
-                    market_context=norm.get("market_context")
-                )
-                # Attach entry zone attributes if present
-                try:
-                    if norm.get("entry_low") not in (None, ""):
-                        setattr(t, "entry_low", self._to_float(norm.get("entry_low")))
-                    if norm.get("entry_high") not in (None, ""):
-                        setattr(t, "entry_high", self._to_float(norm.get("entry_high")))
-                except Exception:
-                    pass
-                out.append(t)
-            except Exception:
-                # keep going even if a row is malformed
-                continue
-        return out
 
 class TradeManager:
     def __init__(self, cfg: Config, sheets: GoogleSheetsIntegration):
