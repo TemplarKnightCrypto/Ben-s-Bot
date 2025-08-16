@@ -1,6 +1,6 @@
 
 # ===============================================
-# Scout Tower - Unified ETH Intraday Bot (v1.0)
+# Scout Tower - Unified ETH Intraday Bot (v2.0)
 # Feature-rich single-file for Render deployment
 # -----------------------------------------------
 # - Multi-exchange data: Binance primary, Kraken fallback (REST; no keys needed)
@@ -79,9 +79,12 @@ class Config:
     sheets_token: Optional[str] = field(default_factory=lambda: os.getenv("SHEETS_TOKEN","").strip() or None)
 
     # Channels (pre-wired defaults; override via ENV)
-    signals_channel_id: int = field(default_factory=lambda: getenv_int("SIGNALS_CHANNEL_ID", 1406315936989970485))
-    status_channel_id:  int = field(default_factory=lambda: getenv_int("STATUS_CHANNEL_ID",  1406315936989970485))
-    errors_channel_id:  int = field(default_factory=lambda: getenv_int("ERRORS_CHANNEL_ID",  1406315936989970485))
+    signals_channel_id: int = field(default_factory=lambda: getenv_int("SIGNALS_CHANNEL_ID", 1406315590569693346))
+    status_channel_id:  int = field(default_factory=lambda: getenv_int("STATUS_CHANNEL_ID",  1406315723071946887))
+    errors_channel_id:  int = field(default_factory=lambda: getenv_int("ERRORS_CHANNEL_ID",  1406315841330348265))
+    # Startup channel (bot online notices)
+    startup_channel_id: int = field(default_factory=lambda: getenv_int("STARTUP_CHANNEL_ID", 1406315936989970485))
+
 
     provider: str = field(default_factory=lambda: os.getenv("PROVIDER","binance").strip().lower())
     use_websocket: bool = field(default_factory=lambda: os.getenv("USE_WEBSOCKET","0").strip() == "1")
@@ -589,6 +592,20 @@ def build_status_embed(cfg: Config, provider_ok: bool, last_price: Optional[floa
     embed.set_footer(text=f"CT: {ct_str} • UTC: {now_utc.strftime('%Y-%m-%d %H:%M:%S UTC')}")
     return embed
 
+
+def build_startup_embed(cfg: Config, open_count: int) -> discord.Embed:
+    now_utc = utc_now()
+    ct_str  = fmt_dt(now_utc, cfg.tz_name)
+    desc = (
+        f"Bot is online and scanning.\n"
+        f"Open trades rehydrated: **{open_count}**\n"
+        f"Provider: **{cfg.provider.upper()}**\n"
+        f"Scan: **{cfg.scan_every_seconds}s** | Min Score: **{cfg.min_signal_score}** | Cooldown: **{cfg.alert_cooldown_minutes}m**"
+    )
+    emb = discord.Embed(title="🚀 Scout Tower Online", description=desc, color=0x7C4DFF, timestamp=now_utc)
+    emb.set_footer(text=f"CT: {ct_str} • UTC: {now_utc.strftime('%Y-%m-%d %H:%M:%S UTC')}")
+    return emb
+
 # -------------- Globals -----------------
 mdp   = MarketDataProvider(CFG)
 sheets= GoogleSheetsIntegration(CFG.sheets_webhook, CFG.sheets_token)
@@ -597,6 +614,49 @@ engine= EnhancedSignalEngine(CFG)
 dio   = DiscordIO(CFG, bot)
 
 _last_price: Optional[float] = None
+
+# -------------- Presets (runtime switchable) -------------
+PRESETS = {
+    "testing": {"scan": 15,  "min_score": 2.0, "cooldown": 2},
+    "level1":  {"scan": 30,  "min_score": 2.5, "cooldown": 5},
+    "level2":  {"scan": 60,  "min_score": 3.0, "cooldown": 15},   # normal
+    "level3":  {"scan": 120, "min_score": 4.0, "cooldown": 30},   # quality only
+}
+
+def _mode_name_from_alias(s: str) -> str:
+    s = (s or "").strip().lower()
+    aliases = {
+        "l1":"level1", "level 1":"level1",
+        "l2":"level2", "level 2":"level2",
+        "l3":"level3", "level 3":"level3",
+        "test":"testing", "t":"testing"
+    }
+    return aliases.get(s, s)
+
+async def apply_preset(name: str) -> dict:
+    """Apply a preset at runtime; return the dict that was applied."""
+    key = _mode_name_from_alias(name)
+    p = PRESETS.get(key)
+    if not p:
+        raise ValueError(f"unknown preset '{name}'")
+    # mutate runtime config
+    CFG.scan_every_seconds   = int(p["scan"])
+    CFG.min_signal_score     = float(p["min_score"])
+    CFG.alert_cooldown_minutes = int(p["cooldown"])
+    # update running task if needed
+    try:
+        if scanner.is_running():
+            scanner.change_interval(seconds=CFG.scan_every_seconds)
+    except Exception as e:
+        log.warning(f"change_interval failed: {e}")
+    return {"name": key, **p}
+
+def current_mode_snapshot() -> dict:
+    return {
+        "scan": CFG.scan_every_seconds,
+        "min_score": CFG.min_signal_score,
+        "cooldown": CFG.alert_cooldown_minutes
+    }
 
 # -------------- Commands -----------------
 @bot.command()
@@ -647,6 +707,28 @@ async def posttest(ctx):
         color=emb.color, timestamp=emb.timestamp)
     await ctx.reply(f"Posted a test embed to channel {CFG.signals_channel_id}. If you don't see it, check bot permissions.")
 
+@bot.command(name="mode")
+async def set_mode(ctx, *, level: str):
+    """Set threshold preset: testing | level1 | level2 | level3.
+    Aliases: test,t,l1,l2,l3, 'level 1' etc."""
+    try:
+        applied = await apply_preset(level)
+        await ctx.reply(
+            f"Mode set to **{applied['name']}**\n"
+            f"Scan: {applied['scan']}s | Min Score: {applied['min_score']} | Cooldown: {applied['cooldown']}m"
+        )
+    except ValueError as ve:
+        await ctx.reply(f"{ve}. Options: testing, level1, level2, level3")
+    except Exception as e:
+        await ctx.reply(f"mode error: {e}")
+
+@bot.command(name="showmode")
+async def show_mode(ctx):
+    s = current_mode_snapshot()
+    await ctx.reply(
+        f"Current mode → Scan: {s['scan']}s | Min Score: {s['min_score']} | Cooldown: {s['cooldown']}m"
+    )
+
 # -------------- On Ready -----------------
 @bot.event
 async def on_ready():
@@ -658,6 +740,12 @@ async def on_ready():
         scanner.start()
     if not daily_summary.is_running():
         daily_summary.start()
+    # Startup notice
+    try:
+        emb = build_startup_embed(CFG, open_count=len(tm.active))
+        await dio.safe_send(CFG.startup_channel_id, title=emb.title, description=emb.description, color=emb.color, timestamp=emb.timestamp)
+    except Exception as e:
+        log.warning(f"startup embed error: {e}")
 
 # -------------- Scanner Loop -----------------
 @tasks.loop(seconds=CFG.scan_every_seconds)
