@@ -1,3 +1,4 @@
+
 # ===============================================
 # Scout Tower - Unified ETH Intraday Bot (v1.0)
 # Feature-rich single-file for Render deployment
@@ -337,11 +338,11 @@ class GoogleSheetsIntegration:
         return out
 
 # -------------- Trade Manager & Storage -----------------
-DATA_DIR = pathlib.Path("/mnt/data")
-(DATA_DIR / "data").mkdir(parents=True, exist_ok=True)
-ALERTS_CSV   = DATA_DIR / "data" / "alerts.csv"
-DECISIONS_CSV= DATA_DIR / "data" / "decisions.csv"
-FILLS_CSV    = DATA_DIR / "data" / "fills.csv"
+DATA_DIR = pathlib.Path(os.getenv("DATA_DIR", "./data"))
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+ALERTS_CSV   = DATA_DIR / "alerts.csv"
+DECISIONS_CSV= DATA_DIR / "decisions.csv"
+FILLS_CSV    = DATA_DIR / "fills.csv"
 
 def append_csv(path: pathlib.Path, row: Dict[str, Any]):
     exists = path.exists()
