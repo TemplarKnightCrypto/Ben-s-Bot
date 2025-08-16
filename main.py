@@ -16,7 +16,7 @@ from discord.ext import tasks, commands
 from flask import Flask, jsonify
 import threading
 
-VERSION = "3.3.4"
+VERSION = "3.3.5"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -311,6 +311,10 @@ class GoogleSheetsIntegration:
             "level_price": t.level_price, "confidence": t.confidence, "knight": t.knight,
             "score": t.score, "market_context": t.market_context
         }
+        if self.token:
+            payload["token"] = self.token
+                if self.token:
+            payload["token"] = self.token
         return await self._post(payload)
     async def write_entry_with_retry(self, t: TradeData, max_retries: int = 3) -> Dict[str, Any]:
         for i in range(max_retries):
@@ -322,7 +326,7 @@ class GoogleSheetsIntegration:
         return await self._post({"action":"update","id":trade_id,"exit_price":exit_price,"exit_reason":exit_reason,"pnl_pct":pnl_pct,"status":"CLOSED"})
     async def rehydrate_open_trades(self) -> List[TradeData]:
         data = await self._get({"action":"open"})
-        rows = data.get("rows", []) or data.get("data", []) or []
+        rows = data.get("rows", []) or data.get("data", []) or data.get("trades", []) or []
         out: List[TradeData] = []
         for r in rows:
             try:
