@@ -1,5 +1,5 @@
 # ===============================================
-# Scout Tower - Enhanced ETH Alert Bot (v3.3.1, Zones)
+# Scout Tower - Enhanced ETH Alert Bot (v3.3.9, Zones)
 # - Adds commands: !checksheets, !rehydrate, !version
 # - Keeps entry ZONES, percent SL/TP, no position-size by default
 # ===============================================
@@ -16,7 +16,7 @@ from discord.ext import tasks, commands
 from flask import Flask, jsonify
 import threading
 
-VERSION = "3.3.6"
+VERSION = "3.3.9"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -66,6 +66,12 @@ class Config:
 
     tz_name: str = field(default_factory=lambda: os.getenv("TZ_NAME", "America/Chicago").strip())
     port: int = field(default_factory=lambda: getenv_int("PORT", 10000))
+
+    # Timeframes
+    fast_interval: str = field(default_factory=lambda: os.getenv("FAST_INTERVAL", "1m").strip())
+    htf_interval: str  = field(default_factory=lambda: os.getenv("HTF_INTERVAL", "15m").strip())
+    buffer_atr_mult: float = field(default_factory=lambda: getenv_float("BUFFER_ATR_MULT", 1.0))
+    min_risk_pct: float   = field(default_factory=lambda: getenv_float("MIN_RISK_PCT", 0.02))
 
     # Zones + toggles
     entry_zone_atr_mult: float = field(default_factory=lambda: getenv_float("ENTRY_ZONE_ATR_MULT", 0.25))
@@ -127,11 +133,24 @@ def validate_ohlc_data(df: pd.DataFrame) -> bool:
     return True
 
 class MarketDataProvider:
+    async def fetch_ohlc_interval(self, interval: str = '1m', limit: int = 200):
+        if self.cfg.provider == "binance":
+            df = await self.fetch_binance_klines(self.cfg.symbol_binance, limit=limit, interval=interval)
+            if df is not None and validate_ohlc_data(df): return df
+            df = await self.fetch_kraken_ohlc(self.cfg.symbol_kraken, interval=interval)
+            if df is not None and validate_ohlc_data(df): return df
+        else:
+            df = await self.fetch_kraken_ohlc(self.cfg.symbol_kraken, interval=interval)
+            if df is not None and validate_ohlc_data(df): return df
+            df = await self.fetch_binance_klines(self.cfg.symbol_binance, limit=limit, interval=interval)
+            if df is not None and validate_ohlc_data(df): return df
+        return None
+
     def __init__(self, cfg: Config):
         self.cfg = cfg
-    async def fetch_binance_klines(self, symbol: str, limit: int = 200):
+    async def fetch_binance_klines(self, symbol: str, limit: int = 200, interval: str = '1m'):
         session = await session_mgr.get_session()
-        url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval=1m&limit={limit}"
+        url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}"
         try:
             async with session.get(url) as r:
                 if r.status != 200:
@@ -146,9 +165,12 @@ class MarketDataProvider:
             df[c] = pd.to_numeric(df[c], errors="coerce")
         df.rename(columns={"open_time":"time"}, inplace=True)
         return df[["time","open","high","low","close","volume"]]
-    async def fetch_kraken_ohlc(self, pair: str):
+    async def fetch_kraken_ohlc(self, pair: str, interval: str = '1m'):
         session = await session_mgr.get_session()
-        url = f"https://api.kraken.com/0/public/OHLC?pair={pair}&interval=1"
+        # Kraken expects minutes: 1, 5, 15, 60, 240, 1440
+        interval_map = {'1m':1,'5m':5,'15m':15,'1h':60,'4h':240,'1d':1440}
+        kr_int = interval_map.get(interval, 1)
+        url = f"https://api.kraken.com/0/public/OHLC?pair={pair}&interval={kr_int}"
         try:
             async with session.get(url) as r:
                 if r.status != 200:
@@ -168,6 +190,9 @@ class MarketDataProvider:
             df[c] = pd.to_numeric(df[c], errors="coerce")
         return df[["time","open","high","low","close","volume"]]
     async def fetch_ohlc(self, limit: int = 200):
+        # Backward-compat default to fast interval
+        return await self.fetch_ohlc_interval(CFG.fast_interval, limit)
+
         if CFG.provider == "binance":
             df = await self.fetch_binance_klines(CFG.symbol_binance, limit)
             if df is not None and validate_ohlc_data(df): return df
@@ -246,6 +271,8 @@ class GoogleSheetsIntegration:
             "timestamp": "timestamp",
             "level name": "level_name",
             "level price": "level_price",
+            "entry low": "entry_low",
+            "entry high": "entry_high",
             "confidence": "confidence",
             "knight": "knight",
             "original score": "score",
@@ -309,7 +336,7 @@ class GoogleSheetsIntegration:
             "take_profit_1": t.take_profit_1, "take_profit_2": t.take_profit_2,
             "status": t.status, "timestamp": t.timestamp, "level_name": t.level_name,
             "level_price": t.level_price, "confidence": t.confidence, "knight": t.knight,
-            "score": t.score, "market_context": t.market_context
+            "score": t.score, "market_context": t.market_context, "entry_low": getattr(t, "entry_low", None), "entry_high": getattr(t, "entry_high", None)
         }
         if self.token:
             payload["token"] = self.token
@@ -324,9 +351,10 @@ class GoogleSheetsIntegration:
         return res
     async def update_exit(self, trade_id: str, exit_price: float, exit_reason: str, pnl_pct: float):
         return await self._post({"action":"update","id":trade_id,"exit_price":exit_price,"exit_reason":exit_reason,"pnl_pct":pnl_pct,"status":"CLOSED"})
-    async def rehydrate_open_trades(self) -> List[TradeData]:
+    
+async def rehydrate_open_trades(self) -> List[TradeData]:
         data = await self._get({"action":"open"})
-        rows = data.get("rows", []) or data.get("data", []) or data.get("trades", []) or []
+        rows = data.get("trades", []) or data.get("rows", []) or data.get("data", []) or []
         out: List[TradeData] = []
         for r in rows:
             try:
@@ -334,7 +362,7 @@ class GoogleSheetsIntegration:
                 # Only OPEN rows
                 if str(norm.get("status","")).strip().upper() != "OPEN":
                     continue
-                out.append(TradeData(
+                t = TradeData(
                     id=str(norm.get("trade_id","")) or str(norm.get("id","")),
                     pair=str(norm.get("asset","ETH/USDT")),
                     side=str(norm.get("side","LONG")).upper().capitalize(),
@@ -350,8 +378,17 @@ class GoogleSheetsIntegration:
                     knight=str(norm.get("knight") or "Sir Leonis"),
                     score=self._to_float(norm.get("score")) if norm.get("score") not in (None, "") else None,
                     market_context=norm.get("market_context")
-                ))
-            except Exception as e:
+                )
+                # Attach entry zone attributes if present
+                try:
+                    if norm.get("entry_low") not in (None, ""):
+                        setattr(t, "entry_low", self._to_float(norm.get("entry_low")))
+                    if norm.get("entry_high") not in (None, ""):
+                        setattr(t, "entry_high", self._to_float(norm.get("entry_high")))
+                except Exception:
+                    pass
+                out.append(t)
+            except Exception:
                 # keep going even if a row is malformed
                 continue
         return out
@@ -373,7 +410,20 @@ class TradeManager:
         d=1 if t.side.upper()=="LONG" else -1; return d*(price-t.entry_price)/t.entry_price*100.0
     async def open_trade(self, t: TradeData):
         self.active[t.id]=t; append_csv(ALERTS_CSV, {**asdict(t), "opened_at": utc_now().isoformat()})
-        await self.sheets.write_entry_with_retry(t)
+        res = await self.sheets.write_entry_with_retry(t)
+        try:
+            http_status = res.get("http_status") if isinstance(res, dict) else None
+            if isinstance(res, dict) and (res.get("status") == "error" or (http_status and int(http_status) >= 400)):
+                # Post an error embed to errors channel for visibility
+                from discord import Embed
+                msg = f"Google Sheets write failed for {t.id}: {res}";
+                # Lazy import of dio from globals
+                try:
+                    await dio.safe_send(CFG.errors_channel_id, embed=build_error_embed(msg, CFG))
+                except Exception:
+                    pass
+        except Exception:
+            pass
     async def close_trade(self, trade_id: str, exit_price: float, reason:str):
         t = self.active.get(trade_id)
         if not t:
@@ -418,17 +468,32 @@ def get_market_context(df: pd.DataFrame)->str:
 
 class EnhancedSignalEngine:
     def __init__(self, cfg: Config): self.cfg=cfg
-    def _risk_targets(self, price: float, atr_val: float, side: str):
-        risk=self.cfg.risk_atr_mult*atr_val
-        if side=="LONG": return price-risk, price+self.cfg.tp1_r_multiple*risk, price+self.cfg.tp2_r_multiple*risk
-        else:            return price+risk, price-self.cfg.tp1_r_multiple*risk, price-self.cfg.tp2_r_multiple*risk
+
+    def _min_risk(self, price: float) -> float:
+        # Ensure we never end up with zero-risk distance
+        return max(price * (self.cfg.min_risk_pct/100.0), 0.01)
+
+    def _structure_targets(self, entry_mid: float, entry_low: float, entry_high: float, side: str, atr_htf: float):
+        buf = max(self.cfg.buffer_atr_mult * max(atr_htf, 0.0), self._min_risk(entry_mid))
+        if side == "LONG":
+            sl = float(entry_low) - buf
+            risk = max(entry_mid - sl, self._min_risk(entry_mid))
+            tp1 = entry_mid + 1.5 * risk
+            tp2 = entry_mid + 3.0 * risk
+        else:
+            sl = float(entry_high) + buf
+            risk = max(sl - entry_mid, self._min_risk(entry_mid))
+            tp1 = entry_mid - 1.5 * risk
+            tp2 = entry_mid - 3.0 * risk
+        return sl, tp1, tp2
+
     def format_signal_reason(self, parts: List[str], score: float)->str:
         conf = "🔥 STRONG" if score>=4.5 else "✅ GOOD" if score>=3.5 else "⚡ MODERATE"
         s=f"**Signal Confidence: {conf} (Score: {score:.1f}/6.0)**\n\n**Triggered Conditions:**\n"
         for i,p in enumerate(parts,1): s+=f"{i}. {p}\n"; return s
-    def generate(self, df: pd.DataFrame) -> Optional[Signal]:
-        if df is None or len(df)<60: return None
-        latest=df.iloc[-1]; prev=df.iloc[-2]
+    def generate(self, df_fast: pd.DataFrame, df_htf: pd.DataFrame) -> Optional[Signal]:
+        if df_fast is None or len(df_fast)<60 or df_htf is None or len(df_htf)<30: return None
+        latest=df_fast.iloc[-1]; prev=df_fast.iloc[-2]
         up = latest["ema20"]>latest["ema50"]; dn = latest["ema20"]<latest["ema50"]
         sl=0.0; score_l=0.0; parts_l=[]; ss=0.0; score_s=0.0; parts_s=[]
         breakout_l = latest["close"]>latest["dc_u"] and up and latest["close"]>latest["vwap"]
@@ -439,9 +504,9 @@ class EnhancedSignalEngine:
         if bounced_l: score_l+=1; parts_l.append("Pullback bounce on EMA20 with RSI>50")
         bounced_s = (prev["close"]>prev["ema20"]) and (latest["close"]<latest["ema20"]) and dn and latest["rsi"]<50
         if bounced_s: score_s+=1; parts_s.append("Pullback bounce under EMA20 with RSI<50")
-        cont_l = up and latest["close"]>latest["ema20"] and latest["rsi"]>55 and latest["atr"]>df["atr"].iloc[-15]
+        cont_l = up and latest["close"]>latest["ema20"] and latest["rsi"]>55 and latest["atr"]>df_fast["atr"].iloc[-15]
         if cont_l: score_l+=1; parts_l.append("Continuation: >EMA20, RSI>55, ATR rising")
-        cont_s = dn and latest["close"]<latest["ema20"] and latest["rsi"]<45 and latest["atr"]>df["atr"].iloc[-15]
+        cont_s = dn and latest["close"]<latest["ema20"] and latest["rsi"]<45 and latest["atr"]>df_fast["atr"].iloc[-15]
         if cont_s: score_s+=1; parts_s.append("Continuation: <EMA20, RSI<45, ATR rising")
         body=abs(latest["close"]-latest["open"]); rng=latest["high"]-latest["low"]; atrv=float(latest["atr"])
         if rng>0 and atrv>0:
@@ -459,8 +524,8 @@ class EnhancedSignalEngine:
             side="SHORT"; score=score_s; reasons=self.format_signal_reason(parts_s, score)
         else:
             return None
-        stop,tp1,tp2 = self._risk_targets(price, atrv, side)
-        market_ctx = get_market_context(df)
+        atr_htf = float(df_htf["atr"].iloc[-1]) if "atr" in df_htf.columns else float('nan')
+        market_ctx = get_market_context(df_fast)
         zone_w = max(atrv*CFG.entry_zone_atr_mult, price*(CFG.entry_zone_min_pct/100.0))
         if side=="LONG":
             if "Breakout" in reasons:
@@ -473,11 +538,19 @@ class EnhancedSignalEngine:
             else:
                 ema20=float(latest["ema20"]); entry_low=ema20; entry_high=ema20+zone_w; entry_label="Pullback entry"
         entry_mid=(entry_low+entry_high)/2.0
+        # Structure-based targets with HTF ATR buffer
+        stop, tp1, tp2 = self._structure_targets(entry_mid, entry_low, entry_high, side, atr_htf if not np.isnan(atr_htf) else atrv)
+        # guard: refuse zero-risk signals
+        if abs(entry_mid - stop) < 1e-9:
+            return None
         return Signal(side=side, score=round(score,2), entry=entry_mid, stop=stop, tp1=tp1, tp2=tp2,
                       reason=reasons, market_context=market_ctx, entry_low=entry_low, entry_high=entry_high, entry_label=entry_label)
 
 def calculate_position_size(balance: float, risk_pct: float, entry: float, stop: float)->float:
-    risk_amount=balance*(risk_pct/100); pr=abs(entry-stop); return 0 if pr==0 else round(risk_amount/pr,4)
+    pr=abs(entry-stop)
+    if pr<=0: return 0.0
+    risk_amount=balance*(risk_pct/100)
+    return round(risk_amount/pr,4)
 
 intents = discord.Intents.default(); intents.message_content=True
 bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
@@ -516,7 +589,7 @@ def build_exit_embed(info: Dict, cfg: Config)->discord.Embed:
     t=info['trade']; pnl=info['pnl_pct']; reason=info['exit_reason']; px=info['exit_price']
     now=utc_now(); ct=fmt_dt(now,cfg.tz_name); color=0x4CAF50 if pnl>0 else 0xF44336; emoji="✅" if pnl>0 else "❌"
     emb=discord.Embed(title=f"{emoji} Alert Closed: {'WIN' if pnl>0 else 'LOSS'} ({reason})",
-        description=(f"**Alert ID:** {t.id}\n**Side:** {t.side}\n**Entry:** ${t.entry_price:.2f}\n**Exit:** ${px:.2f}\n**P&L:** {pnl:+.2f}%\n**Original Score:** {t.score:.2f}/6.0"), color=color, timestamp=now)
+        description=(f"**Alert ID:** {t.id}\n**Side:** {t.side}\n**Entry:** ${t.entry_price:.2f}\n**Exit:** ${px:.2f}\n**P&L:** {pnl:+.2f}%\n**Original Score:** {t.score:.2f}/6.0".replace("**Original Score:** {trade.score:.2f}/6.0", f"**Original Score:** {trade.score:.2f}/6.0" if isinstance(trade.score, (int, float)) else "**Original Score:** —") ), color=color, timestamp=now)
     emb.set_footer(text=f"CT: {ct} • UTC: {now.strftime('%Y-%m-%d %H:%M:%S UTC')}"); return emb
 
 def build_error_embed(msg:str, cfg: Config)->discord.Embed:
@@ -561,12 +634,13 @@ async def scanner():
     global _last_price
     if scanner_paused: return
     try:
-        df = await mdp.fetch_ohlc(limit=200)
-        if df is None or df.empty: return
-        df = add_indicators(df); latest=df.iloc[-1]; _last_price=float(latest["close"])
+        df = await mdp.fetch_ohlc_interval(CFG.fast_interval, limit=200)
+        df_htf = await mdp.fetch_ohlc_interval(CFG.htf_interval, limit=200)
+        if df is None or df.empty or df_htf is None or df_htf.empty: return
+        df = add_indicators(df); df_htf = add_indicators(df_htf); latest=df.iloc[-1]; _last_price=float(latest["close"])
         for info in await tm.check_alert_exits(_last_price):
             await dio.safe_send(CFG.signals_channel_id, embed=build_exit_embed(info, CFG))
-        sig = engine.generate(df)
+        sig = engine.generate(df, df_htf)
         if not sig: return
         if tm.on_cooldown(sig.side.upper()): return
         trade_id=f"ETH-{int(time.time())}"
@@ -611,6 +685,9 @@ async def testsheets(ctx):
             entry_price=9999.99, stop_loss=9900.00, take_profit_1=10050.00, take_profit_2=10100.00,
             confidence="Connection Test", score=0.0, level_name="Testing Google Sheets Integration"
         )
+        # add entry zone attributes
+        setattr(test_trade, "entry_low", 9995.00)
+        setattr(test_trade, "entry_high", 10005.00)
         res = await sheets.write_entry(test_trade)
         await ctx.reply(f"Sheets POST result (status={res.get('http_status','?')}):\n```{res}```")
     except Exception as e:
