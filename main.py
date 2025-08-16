@@ -16,7 +16,7 @@ from discord.ext import tasks, commands
 from flask import Flask, jsonify
 import threading
 
-VERSION = "3.3.5"
+VERSION = "3.3.6"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -313,7 +313,7 @@ class GoogleSheetsIntegration:
         }
         if self.token:
             payload["token"] = self.token
-                if self.token:
+
             payload["token"] = self.token
         return await self._post(payload)
     async def write_entry_with_retry(self, t: TradeData, max_retries: int = 3) -> Dict[str, Any]:
