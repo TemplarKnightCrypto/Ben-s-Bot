@@ -79,9 +79,9 @@ class Config:
     sheets_token: Optional[str] = field(default_factory=lambda: os.getenv("SHEETS_TOKEN","").strip() or None)
 
     # Channels (pre-wired defaults; override via ENV)
-    signals_channel_id: int = field(default_factory=lambda: getenv_int("SIGNALS_CHANNEL_ID", 1399532925279666278))
-    status_channel_id:  int = field(default_factory=lambda: getenv_int("STATUS_CHANNEL_ID",  1399532442075005038))
-    errors_channel_id:  int = field(default_factory=lambda: getenv_int("ERRORS_CHANNEL_ID",  1399067396488302623))
+    signals_channel_id: int = field(default_factory=lambda: getenv_int("SIGNALS_CHANNEL_ID", 1406315936989970485))
+    status_channel_id:  int = field(default_factory=lambda: getenv_int("STATUS_CHANNEL_ID",  1406315936989970485))
+    errors_channel_id:  int = field(default_factory=lambda: getenv_int("ERRORS_CHANNEL_ID",  1406315936989970485))
 
     provider: str = field(default_factory=lambda: os.getenv("PROVIDER","binance").strip().lower())
     use_websocket: bool = field(default_factory=lambda: os.getenv("USE_WEBSOCKET","0").strip() == "1")
@@ -225,7 +225,7 @@ def vwap(df: pd.DataFrame) -> pd.Series:
     pv = (df["close"] * df["volume"]).cumsum()
     vv = df["volume"].replace(0, np.nan).cumsum()
     out = pv / vv
-    return out.fillna(method="ffill").fillna(df["close"])
+    return out.ffill().fillna(df["close"])
 
 def donchian(df: pd.DataFrame, length: int = 20) -> Tuple[pd.Series, pd.Series]:
     upper = df["high"].rolling(length).max()
@@ -276,7 +276,11 @@ class GoogleSheetsIntegration:
                 txt = await r.text()
                 if r.status != 200:
                     log.warning(f"Sheets POST {r.status}: {txt}")
-                return json.loads(txt) if txt else {"status":"error","message":"empty"}
+                import json as _json
+                try:
+                    return _json.loads(txt) if txt else {"status":"error","message":"empty"}
+                except Exception:
+                    return {"status":"error","message":"non-json", "raw": txt[:200]}
         except Exception as e:
             log.error(f"Sheets POST error: {e}")
             return {"status":"error","message":str(e)}
@@ -291,7 +295,11 @@ class GoogleSheetsIntegration:
                 txt = await r.text()
                 if r.status != 200:
                     log.warning(f"Sheets GET {r.status}: {txt}")
-                return json.loads(txt) if txt else {"status":"error","message":"empty"}
+                import json as _json
+                try:
+                    return _json.loads(txt) if txt else {"status":"error","message":"empty"}
+                except Exception:
+                    return {"status":"error","message":"non-json", "raw": txt[:200]}
         except Exception as e:
             log.error(f"Sheets GET error: {e}")
             return {"status":"error","message":str(e)}
@@ -527,13 +535,19 @@ class DiscordIO:
     async def safe_send(self, channel_id: int, **embed_kwargs):
         ch = self.channel(channel_id)
         if not ch:
-            log.warning(f"Channel {channel_id} not found")
+            try:
+                ch = await self.client.fetch_channel(channel_id)
+            except Exception as fe:
+                log.error(f"fetch_channel failed for {channel_id}: {fe}")
+                ch = None
+        if not ch:
+            log.warning(f"Channel {channel_id} unavailable – check bot permissions and that it’s in the guild.")
             return
         embed = discord.Embed(**embed_kwargs)
         try:
             await ch.send(embed=embed)
         except Exception as e:
-            log.error(f"send error: {e}")
+            log.error(f"send error: {e} – Missing Access usually means wrong channel ID or no Send Messages permission for the bot role.")
 
 # -------------- Embeds -----------------
 def build_trade_embed(t: TradeData, cfg: Config) -> discord.Embed:
@@ -610,6 +624,28 @@ async def force(ctx):
             await ctx.reply("No signal above threshold")
     except Exception as e:
         await ctx.reply(f"force error: {e}")
+
+@bot.command()
+async def posttest(ctx):
+    """Send a test embed to the signals channel to confirm permissions."""
+    t = TradeData(
+        id="TEST-123",
+        pair="ETH/USDT",
+        side="LONG",
+        entry_price=2000,
+        stop_loss=1950,
+        take_profit_1=2030,
+        take_profit_2=2060,
+        confidence="Test",
+        knight="Sir Leonis",
+        score=5.0,
+        level_name="Test embed"
+    )
+    emb = build_trade_embed(t, CFG)
+    await dio.safe_send(CFG.signals_channel_id,
+        title=emb.title, description=emb.description,
+        color=emb.color, timestamp=emb.timestamp)
+    await ctx.reply(f"Posted a test embed to channel {CFG.signals_channel_id}. If you don't see it, check bot permissions.")
 
 # -------------- On Ready -----------------
 @bot.event
