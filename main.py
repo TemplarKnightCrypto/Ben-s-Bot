@@ -1,5 +1,5 @@
 # ===============================================
-# Scout Tower - Enhanced ETH Alert Bot (v3.4.1 ENHANCED)
+# Scout Tower - Enhanced ETH Alert Bot v3.4.2
 # - Engine: Donchian breakout + EMA trend + RSI/VWAP/ATR filters
 # - Zones: Entry band, SL/TP from ATR + structure
 # - Providers: Binance primary, Kraken fallback
@@ -26,7 +26,7 @@ from discord.ext import tasks, commands
 
 from flask import Flask, jsonify
 
-VERSION = "3.4.1"
+VERSION = "3.4.2"
 
 # ---------------- Logging ----------------
 logging.basicConfig(
