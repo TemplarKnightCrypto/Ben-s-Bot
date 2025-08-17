@@ -1,17 +1,13 @@
 # ===============================================
-# Scout Tower - Enhanced ETH Alert Bot v3.5.1 (Hybrid Triggers)
-# - Bias: Donchian midline (directional bias)
-# - Triggers: EMA20/50 crossover OR RSI momentum burst (inside bias)
-# - Confluence Scoring: EMA trend, RSI, VWAP, Candle body + (NEW) MACD hist, Volume spike,
-#                       Stoch RSI burst, VWAP bounce cross, ATR expansion
-# - Legacy Breakout: Optional Donchian close-based entries (configurable)
+# Scout Tower - Enhanced ETH Alert Bot v3.4.3
+# - Engine: Donchian breakout + EMA trend + RSI/VWAP/ATR filters
 # - Zones: Entry band, SL/TP from ATR + structure
 # - Providers: Binance primary, Kraken fallback
 # - Discord: commands (modes, stats, csv, active/close/result, sheets utils)
 # - Sheets: webhook write + rehydrate of open alerts
 # - CSV: alerts.csv / decisions.csv / fills.csv
 # - Flask: /health and /metrics
-# - Heartbeat, data quality checks, smart status updates
+# - ENHANCED: Heartbeat reports, market analysis, visual health indicators
 # - EXIT ALERTS: Automatic TP1/TP2/SL detection and alerts
 # ===============================================
 
@@ -30,7 +26,7 @@ from discord.ext import tasks, commands
 
 from flask import Flask, jsonify
 
-VERSION = "3.5.1"
+VERSION = "3.4.3"
 
 # ---------------- Logging ----------------
 logging.basicConfig(
@@ -57,12 +53,6 @@ def clamp(v, lo, hi): return max(lo, min(hi, v))
 def pct(a, b):  # (a vs b - 1)*100
     if b == 0: return 0
     return (a / b - 1.0) * 100.0
-
-def _crosses_up(prev_a: float, a: float, prev_b: float, b: float) -> bool:
-    return prev_a <= prev_b and a > b
-
-def _crosses_down(prev_a: float, a: float, prev_b: float, b: float) -> bool:
-    return prev_a >= prev_b and a < b
 
 # ---------------- Files/CSV ----------------
 DATA_DIR = Path(os.getenv("DATA_DIR", "./data"))
@@ -102,12 +92,6 @@ class Config:
     min_score: float = field(default_factory=lambda: float(os.getenv("MIN_SCORE","2.5") or 2.5))
     cooldown_minutes: int = field(default_factory=lambda: int(os.getenv("COOLDOWN_MIN","5") or 5))
     zone_bps: int = field(default_factory=lambda: int(os.getenv("ZONE_BPS","5") or 5)) # entry band: 5 bps = 0.05%
-
-    # Entry mode: 'hybrid' (bias + EMA/RSI triggers), 'breakout' (Donchian close), 'both'
-    entry_mode: str = field(default_factory=lambda: os.getenv("ENTRY_MODE","hybrid").strip().lower())
-
-        # Dual timeframe
-    trigger_interval: str = field(default_factory=lambda: os.getenv("TRIGGER_INTERVAL","15m"))
 
     # HTTP
     port: int = field(default_factory=lambda: int(os.getenv("PORT","10000") or 10000))
@@ -150,7 +134,6 @@ def donchian(df: pd.DataFrame, n: int = 20) -> Tuple[pd.Series, pd.Series]:
 
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
-    # Core
     df["ema20"] = ema(df["close"], 20)
     df["ema50"] = ema(df["close"], 50)
     df["rsi"]   = rsi(df["close"], 14)
@@ -158,27 +141,7 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df["vwap"]  = vwap(df)
     dc_u, dc_l  = donchian(df, 20)
     df["dc_u"], df["dc_l"] = dc_u, dc_l
-
-    # ---- Added: MACD (12/26/9) + histogram ----
-    ema12 = ema(df["close"], 12)
-    ema26 = ema(df["close"], 26)
-    df["macd"]        = ema12 - ema26
-    df["macd_signal"] = df["macd"].ewm(span=9, adjust=False).mean()
-    df["macd_hist"]   = df["macd"] - df["macd_signal"]
-
-    # ---- Added: Stoch RSI %K (14 length, 3 smoothing) ----
-    rsi14 = df["rsi"]
-    rsi_min = rsi14.rolling(14).min()
-    rsi_max = rsi14.rolling(14).max().replace(0, np.nan)
-    stoch_rsi = (rsi14 - rsi_min) / (rsi_max - rsi_min)
-    df["stoch_rsi_k"] = stoch_rsi.rolling(3).mean().clip(lower=0.0, upper=1.0)
-
-    # ---- Added: Volume/ATR context ----
-    df["vol_ma20"] = df["volume"].rolling(20).mean()
-    df["atr_ma50"] = df["atr"].rolling(50).mean()
-
     return df
-
 # ---------------- Market Data Providers ----------------
 # Global tracking for health monitoring
 _last_successful_fetch: Optional[datetime] = None
@@ -336,7 +299,7 @@ def check_signal_drought() -> Optional[str]:
 
 async def market_analysis_report() -> str:
     """Why no signals? Market analysis"""
-    df = await md_price.fetch_ohlc(limit=100)
+    df = await md.fetch_ohlc(limit=100)
     if df is None:
         return "⚠️ **DATA ISSUE**: Cannot fetch market data"
     
@@ -672,156 +635,51 @@ def current_mode_snapshot() -> dict:
         "cooldown": CFG.cooldown_minutes
     }
 
-# ---------------- Confluence Score ----------------
+# ---------------- Signal Engine ----------------
 def score_signal(df: pd.DataFrame, i: int, side: str) -> float:
-    row  = df.iloc[i]
-    prev = df.iloc[i-1] if i > 0 else row
-
-    # ---- Existing factors ----
+    row = df.iloc[i]
     ema_trend = (row["ema20"] > row["ema50"]) if side=="LONG" else (row["ema20"] < row["ema50"])
-    rsi_ok    = (row["rsi"] > 45) if side=="LONG" else (row["rsi"] < 55)
-    vwap_ok   = (row["close"] >= row["vwap"]) if side=="LONG" else (row["close"] <= row["vwap"])
+    rsi_ok = (row["rsi"] > 45) if side=="LONG" else (row["rsi"] < 55)
+    vwap_ok = (row["close"] >= row["vwap"]) if side=="LONG" else (row["close"] <= row["vwap"])
 
     base = 0.0
     base += 1.0 if ema_trend else 0.0
-    base += 0.7 if rsi_ok    else 0.0
-    base += 0.7 if vwap_ok   else 0.0
-
-    # Candle body quality
+    base += 0.7 if rsi_ok else 0.0
+    base += 0.7 if vwap_ok else 0.0
+    # candle body quality
     body = abs(row["close"] - row["open"])
     rng  = row["high"] - row["low"]
     body_ok = (body >= 0.5 * rng) if rng > 0 else False
     base += 0.6 if body_ok else 0.0
-
-    # ---- New confluence factors ----
-
-    # 1) MACD histogram flip / agreement
-    macd_hist      = float(row.get("macd_hist", 0.0))
-    macd_hist_prev = float(prev.get("macd_hist", 0.0))
-    if side == "LONG":
-        macd_flip_up = (macd_hist_prev <= 0 and macd_hist > 0)
-        if macd_flip_up:
-            base += 0.8
-        elif macd_hist > 0:
-            base += 0.4
-    else:
-        macd_flip_down = (macd_hist_prev >= 0 and macd_hist < 0)
-        if macd_flip_down:
-            base += 0.8
-        elif macd_hist < 0:
-            base += 0.4
-
-    # 2) Volume spike vs 20-bar average
-    vol      = float(row.get("volume", 0.0))
-    vol_ma20 = float(row.get("vol_ma20", 0.0) or 0.0)
-    if vol_ma20 > 0 and vol >= 1.8 * vol_ma20:
-        base += 0.6
-
-    # 3) Stoch RSI burst out of OS/OB
-    k      = float(row.get("stoch_rsi_k", 0.5))
-    k_prev = float(prev.get("stoch_rsi_k", 0.5))
-    if side == "LONG":
-        if k_prev <= 0.2 and k > 0.2:
-            base += 0.5
-    else:
-        if k_prev >= 0.8 and k < 0.8:
-            base += 0.5
-
-    # 4) VWAP bounce cross (mean reversion into trend)
-    if side == "LONG":
-        if (prev["close"] <= prev["vwap"]) and (row["close"] > row["vwap"]):
-            base += 0.5
-    else:
-        if (prev["close"] >= prev["vwap"]) and (row["close"] < row["vwap"]):
-            base += 0.5
-
-    # 5) ATR expansion (energy in the move)
-    atr     = float(row.get("atr", 0.0))
-    atr_ma  = float(row.get("atr_ma50", 0.0) or 0.0)
-    if atr_ma > 0 and atr > atr_ma:
-        base += 0.3
-
     return round(base, 2)
 
-# ---------------- Signal Engine ----------------
-def _build_trade(side: str, row: pd.Series, level: float) -> dict:
-    """Common trade construction with ATR-based SL/TP and narrow entry zone around level"""
-    atrv = float(row["atr"])
-    zone = (level*(1 - CFG.zone_bps/10000.0), level*(1 + CFG.zone_bps/10000.0))
-    if side == "LONG":
-        sl  = row["ema50"] - 0.5*atrv
+def generate_signal(df: pd.DataFrame, price_now: float) -> Optional[dict]:
+    i = len(df)-1
+    row = df.iloc[i]
+    # breakouts
+    if row["close"] > row["dc_u"] and row["ema20"] > row["ema50"]:
+        side = "LONG"
+        score = score_signal(df, i, side)
+        if score < CFG.min_score: return None
+        atrv = float(row["atr"])
+        level = float(row["dc_u"])
+        zone = (level*(1 - CFG.zone_bps/10000.0), level*(1 + CFG.zone_bps/10000.0))
+        sl = row["ema50"] - 0.5*atrv
         tp1 = level + 1.5*atrv
         tp2 = level + 3.0*atrv
-    else:
-        sl  = row["ema50"] + 0.5*atrv
+        return {"side": side, "zone": zone, "sl": float(sl), "tp1": float(tp1), "tp2": float(tp2), "score": score}
+
+    if row["close"] < row["dc_l"] and row["ema20"] < row["ema50"]:
+        side = "SHORT"
+        score = score_signal(df, i, side)
+        if score < CFG.min_score: return None
+        atrv = float(row["atr"])
+        level = float(row["dc_l"])
+        zone = (level*(1 - CFG.zone_bps/10000.0), level*(1 + CFG.zone_bps/10000.0))
+        sl = row["ema50"] + 0.5*atrv
         tp1 = level - 1.5*atrv
         tp2 = level - 3.0*atrv
-    return {"side": side, "zone": (float(zone[0]), float(zone[1])), "sl": float(sl), "tp1": float(tp1), "tp2": float(tp2)}
-
-def generate_signal(df: pd.DataFrame, price_now: float) -> Optional[dict]:
-    """
-    Hybrid engine with configurable entry modes:
-      - 'hybrid': Donchian midline = bias; triggers = EMA crossover OR RSI burst (inside bias)
-      - 'breakout': Donchian close above/below bands (legacy)
-      - 'both': try hybrid first, then breakout if none
-    """
-    i = len(df)-1
-    if i < 2: 
-        return None
-
-    row     = df.iloc[i]
-    prev    = df.iloc[i-1]
-
-    # ----- Donchian bias from midline -----
-    dc_mid      = 0.5 * (row["dc_u"] + row["dc_l"])
-    long_bias   = row["close"] >= dc_mid
-    short_bias  = row["close"] <= dc_mid
-
-    # ----- Triggers for hybrid mode -----
-    ema_cross_up   = _crosses_up(prev["ema20"], row["ema20"], prev["ema50"], row["ema50"])
-    ema_cross_down = _crosses_down(prev["ema20"], row["ema20"], prev["ema50"], row["ema50"])
-    rsi_burst_up   = _crosses_up(prev["rsi"], row["rsi"], 55.0, 55.0)
-    rsi_burst_down = _crosses_down(prev["rsi"], row["rsi"], 45.0, 45.0)
-
-    long_trigger_hybrid  = long_bias  and (ema_cross_up   or rsi_burst_up)
-    short_trigger_hybrid = short_bias and (ema_cross_down or rsi_burst_down)
-
-    # Try HYBRID mode if enabled
-    if CFG.entry_mode in ("hybrid","both"):
-        if long_trigger_hybrid:
-            side  = "LONG"
-            score = score_signal(df, i, side)
-            if score >= CFG.min_score:
-                sig = _build_trade(side, row, float(row["close"]))
-                sig["score"] = score
-                return sig
-        if short_trigger_hybrid:
-            side  = "SHORT"
-            score = score_signal(df, i, side)
-            if score >= CFG.min_score:
-                sig = _build_trade(side, row, float(row["close"]))
-                sig["score"] = score
-                return sig
-
-    # Legacy Donchian breakout mode (close outside channel)
-    if CFG.entry_mode in ("breakout","both"):
-        if row["close"] > row["dc_u"] and row["ema20"] > row["ema50"]:
-            side  = "LONG"
-            score = score_signal(df, i, side)
-            if score >= CFG.min_score:
-                level = float(row["dc_u"])
-                sig = _build_trade(side, row, level)
-                sig["score"] = score
-                return sig
-        if row["close"] < row["dc_l"] and row["ema20"] < row["ema50"]:
-            side  = "SHORT"
-            score = score_signal(df, i, side)
-            if score >= CFG.min_score:
-                level = float(row["dc_l"])
-                sig = _build_trade(side, row, level)
-                sig["score"] = score
-                return sig
-
+        return {"side": side, "zone": zone, "sl": float(sl), "tp1": float(tp1), "tp2": float(tp2), "score": score}
     return None
 
 # ---------------- Embeds ----------------
@@ -912,11 +770,11 @@ async def create_online_embed() -> discord.Embed:
     
     # Add market context
     try:
-        df = await md_price.fetch_ohlc(limit=50)
+        df = await md.fetch_ohlc(limit=50)
         if df is not None and not df.empty:
             current_price = df["close"].iloc[-1]
-            idx = -min(24, len(df)-1)
-            daily_change = pct(current_price, df["close"].iloc[idx]) if len(df) > 1 else 0.0
+            daily_change = pct(current_price, df["close"].iloc[-min(24, len(df)-1)])  # 24h change or available
+            
             embed.add_field(
                 name="📊 Market Status", 
                 value=f"ETH: ${current_price:,.2f} ({daily_change:+.1f}%)",
@@ -934,8 +792,7 @@ async def create_online_embed() -> discord.Embed:
         name="⚙️ Configuration",
         value=f"""Mode: {mode_emoji.get(current_mode, '⚪')} **{current_mode.upper()}**
 Provider: {CFG.provider.upper()} {data_health}
-Scan: {CFG.scan_every_seconds}s | Score: {CFG.min_score} | Cooldown: {CFG.cooldown_minutes}m
-Entry Mode: **{CFG.entry_mode.upper()}** | Trigger TF: **{CFG.trigger_interval}** | Price TF: **{CFG.interval}**""",
+Scan: {CFG.scan_every_seconds}s | Score: {CFG.min_score} | Cooldown: {CFG.cooldown_minutes}m""",
         inline=False
     )
     
@@ -968,7 +825,7 @@ async def create_status_embed() -> discord.Embed:
     
     # Market Overview Section
     try:
-        df = await md_price.fetch_ohlc(limit=100)
+        df = await md.fetch_ohlc(limit=100)
         if df is not None and not df.empty:
             df = add_indicators(df)
             current = df.iloc[-1]
@@ -1012,8 +869,7 @@ async def create_status_embed() -> discord.Embed:
         name="⚙️ System Health",
         value=f"""**Data Feed:** {CFG.provider.upper()} {data_health}
 **Sheets:** {'Enabled' if CFG.sheets_webhook else 'Disabled'} {sheets_health}
-**Scanner:** {'Running' if scanner.is_running() else 'Stopped'} {scanner_health}
-**Entry Mode:** {CFG.entry_mode.upper()}""",
+**Scanner:** {'Running' if scanner.is_running() else 'Stopped'} {scanner_health}""",
         inline=True
     )
     
@@ -1022,8 +878,10 @@ async def create_status_embed() -> discord.Embed:
         active_summary = []
         for trade in list(tm.active.values())[:3]:  # Show max 3
             try:
+                # Handle different datetime formats
                 opened_time = trade.opened_at
                 if isinstance(opened_time, str):
+                    # Parse the timestamp string
                     if opened_time.endswith('Z'):
                         opened_time = opened_time[:-1] + '+00:00'
                     opened_dt = datetime.fromisoformat(opened_time)
@@ -1034,6 +892,7 @@ async def create_status_embed() -> discord.Embed:
                 
                 age = (utc_now() - opened_dt).total_seconds() // 60
                 
+                # Status indicators
                 status = []
                 if trade.entry_confirmed: status.append("✅")
                 if trade.tp1_hit: status.append("🎯1")
@@ -1088,8 +947,7 @@ async def create_status_embed() -> discord.Embed:
     return embed
 
 # ---------------- Global Singletons ----------------
-md_price = MarketData(CFG.pair, CFG.interval)
-md_trigger = MarketData(CFG.pair, CFG.trigger_interval)
+md = MarketData(CFG.pair, CFG.interval)
 sheets = GoogleSheetsIntegration(CFG.sheets_webhook, CFG.sheets_token)
 tm = TradeManager(CFG, sheets)
 attach_metrics(tm)
@@ -1101,7 +959,7 @@ _last_alert_time: Optional[datetime] = None
 async def _tick_status():
     # status heartbeat in logs to show bot alive
     if random.random() < 0.02:
-        log.info(f"Status: scan={CFG.scan_every_seconds}s min_score={CFG.min_score} cd={CFG.cooldown_minutes}m mode={CFG.entry_mode}")
+        log.info(f"Status: scan={CFG.scan_every_seconds}s min_score={CFG.min_score} cd={CFG.cooldown_minutes}m")
 
 @tasks.loop(minutes=30)
 async def heartbeat_report():
@@ -1112,7 +970,7 @@ async def heartbeat_report():
             if ch:
                 last_signal_ago = "Never" if not _last_alert_time else f"{(utc_now() - _last_alert_time).total_seconds()//60:.0f}m ago"
                 
-                df = await md_price.fetch_ohlc(limit=50)
+                df = await md.fetch_ohlc(limit=50)
                 current_price = df["close"].iloc[-1] if df is not None and not df.empty else "Unknown"
                 
                 embed = discord.Embed(
@@ -1124,7 +982,6 @@ async def heartbeat_report():
                 embed.add_field(name="Current ETH Price", value=f"${current_price:.2f}" if isinstance(current_price, (int, float)) else str(current_price), inline=True)
                 embed.add_field(name="Mode", value=f"{get_current_mode()} (scan:{CFG.scan_every_seconds}s)", inline=True)
                 embed.add_field(name="Score Threshold", value=f"{CFG.min_score}", inline=True)
-                embed.add_field(name="Entry Mode", value=f"{CFG.entry_mode}", inline=True)
                 embed.add_field(name="System Health", value=get_system_health_emoji(), inline=True)
                 embed.set_footer(text=f"v{VERSION} • Heartbeat")
                 await ch.send(embed=embed)
@@ -1135,7 +992,7 @@ async def heartbeat_report():
 async def data_quality_check():
     """Monitor for data issues"""
     try:
-        df = await md_price.fetch_ohlc(limit=10)
+        df = await md.fetch_ohlc(limit=10)
         if df is None:
             await send_error_alert("⚠️ **DATA FAILURE**: Cannot fetch OHLC data")
             return
@@ -1162,10 +1019,11 @@ async def smart_status_update():
         try:
             ch = bot.get_channel(CFG.status_channel_id)
             if ch:
+                # Only send if interesting conditions
                 should_update = any([
-                    len(tm.active) > 0,
-                    hours_since_last_signal() > 4,
-                    get_system_health_emoji() != "🟢"
+                    len(tm.active) > 0,  # Has active trades
+                    hours_since_last_signal() > 4,  # Long quiet period
+                    get_system_health_emoji() != "🟢"  # Health issues
                 ])
                 
                 if should_update:
@@ -1173,7 +1031,6 @@ async def smart_status_update():
                     await ch.send(embed=embed)
         except Exception as e:
             log.error(f"Smart status update error: {e}")
-
 
 @tasks.loop(seconds=5)
 async def scanner():
@@ -1184,27 +1041,19 @@ async def scanner():
         if _last_alert_time and (now - _last_alert_time).total_seconds() < CFG.scan_every_seconds:
             return
 
-        # Fetch price (1m or CFG.interval) and trigger frame (15m by default)
-        df_price = await md_price.fetch_ohlc(limit=300)
-        df_trig  = await md_trigger.fetch_ohlc(limit=300)
-        if df_price is None or df_price.empty or df_trig is None or df_trig.empty:
-            return
+        df = await md.fetch_ohlc(limit=250)
+        if df is None or df.empty: return
+        df = df.rename(columns={"open":"open","high":"high","low":"low","close":"close","volume":"volume"})
+        df["open"] = df["open"].astype(float)
+        df["high"] = df["high"].astype(float)
+        df["low"]  = df["low"].astype(float)
+        df["close"]= df["close"].astype(float)
+        df["volume"]=df["volume"].astype(float)
+        df = add_indicators(df)
 
-        # Clean and compute indicators on TRIGGER frame only
-        for df in (df_price, df_trig):
-            df.rename(columns={"open":"open","high":"high","low":"low","close":"close","volume":"volume"}, inplace=True)
-            df["open"] = df["open"].astype(float)
-            df["high"] = df["high"].astype(float)
-            df["low"]  = df["low"].astype(float)
-            df["close"]= df["close"].astype(float)
-            df["volume"]=df["volume"].astype(float)
-
-        df_trig = add_indicators(df_trig)
-
-        # Use 1m price for monitoring exits and for price_now
-        price_now = float(df_price["close"].iloc[-1])
-
-        # 1) Monitor exits on price timeframe
+        price_now = float(df["close"].iloc[-1])
+        
+        # Check for exits on active trades first
         if tm.active:
             exits = await tm.check_exits(price_now)
             for exit_info in exits:
@@ -1212,11 +1061,10 @@ async def scanner():
                     ch = bot.get_channel(CFG.signals_channel_id)
                     if ch:
                         await ch.send(embed=embed_trade_exit(exit_info))
-
-        # 2) Generate new signals from TRIGGER timeframe
-        sig = generate_signal(df_trig, price_now)
-        if not sig:
-            return
+        
+        # Check for new signals
+        sig = generate_signal(df, price_now)
+        if not sig: return
 
         # cooldown per side simple guard
         if _last_alert_time and (utc_now()-_last_alert_time).total_seconds() < CFG.cooldown_minutes*60:
@@ -1238,6 +1086,8 @@ async def scanner():
 
     except Exception as e:
         log.error(f"Scanner error: {e}")
+
+# ---------------- Discord Commands ----------------
 @bot.event
 async def on_ready():
     log.info(f"Discord logged in as {bot.user}")
@@ -1254,7 +1104,7 @@ async def on_ready():
 
 @bot.command(name="version")
 async def version_cmd(ctx):
-    await ctx.reply(f"Scout Tower v{VERSION} | scan={CFG.scan_every_seconds}s | min_score={CFG.min_score} | cd={CFG.cooldown_minutes}m | mode={CFG.entry_mode}")
+    await ctx.reply(f"Scout Tower v{VERSION} | scan={CFG.scan_every_seconds}s | min_score={CFG.min_score} | cd={CFG.cooldown_minutes}m")
 
 @bot.command(name="status")
 async def status_cmd(ctx):
@@ -1311,7 +1161,7 @@ async def exits_cmd(ctx):
     )
     
     try:
-        df = await md_price.fetch_ohlc(limit=5)
+        df = await md.fetch_ohlc(limit=5)
         current_price = df["close"].iloc[-1] if df is not None and not df.empty else 0
         embed.add_field(name="Current Price", value=f"${current_price:.2f}", inline=False)
     except:
@@ -1384,7 +1234,7 @@ async def exits_cmd(ctx):
 @bot.command(name="market")
 async def market_status(ctx):
     """Comprehensive market overview"""
-    df = await md_price.fetch_ohlc(limit=100)
+    df = await md.fetch_ohlc(limit=100)
     if df is None:
         return await ctx.reply("❌ Cannot fetch market data")
     
@@ -1422,12 +1272,11 @@ async def debug_status(ctx):
     info.append(f"Last successful fetch: {_last_successful_fetch}")
     info.append(f"Last fetch error: {_last_fetch_error}")
     info.append(f"Data provider: {CFG.provider}")
-    info.append(f"Price TF: {CFG.interval} | Trigger TF: {CFG.trigger_interval}")
-    info.append(f"Entry mode: {CFG.entry_mode}")
     info.append(f"Active tasks: heartbeat={heartbeat_report.is_running()}, data_check={data_quality_check.is_running()}")
     
+    # Test data fetch
     try:
-        df = await md_price.fetch_ohlc(limit=5)
+        df = await md.fetch_ohlc(limit=5)
         info.append(f"Data fetch: ✅ Latest: {df.index[-1] if df is not None and not df.empty else 'Failed'}")
     except Exception as e:
         info.append(f"Data fetch: ❌ {str(e)}")
@@ -1439,28 +1288,17 @@ async def debug_status(ctx):
 async def cmd_mode(ctx, *, level: str = None):
     if not level:
         s = current_mode_snapshot()
-        return await ctx.reply(f"Current mode → scan:{s['scan']}s | min_score:{s['min_score']} | cooldown:{s['cooldown']}m | entry:{CFG.entry_mode}")
+        return await ctx.reply(f"Current mode → scan:{s['scan']}s | min_score:{s['min_score']} | cooldown:{s['cooldown']}m")
     try:
         applied = await apply_preset(level)
         await ctx.reply(f"Mode set → {applied['mode']} | scan:{applied['scan']}s | min_score:{applied['min_score']} | cooldown:{applied['cooldown']}m")
     except Exception as e:
         await ctx.reply(f"Error: {e}")
 
-@bot.command(name="entrymode")
-async def entrymode_cmd(ctx, *, mode: str = None):
-    """Set entry mode: hybrid | breakout | both"""
-    if not mode:
-        return await ctx.reply(f"Current entry mode: {CFG.entry_mode}")
-    mode = (mode or "").strip().lower()
-    if mode not in ("hybrid","breakout","both"):
-        return await ctx.reply("Usage: !entrymode <hybrid|breakout|both>")
-    CFG.entry_mode = mode
-    await ctx.reply(f"Entry mode set to {CFG.entry_mode}")
-
 @bot.command(name="showmode")
 async def cmd_showmode(ctx):
     s = current_mode_snapshot()
-    await ctx.reply(f"scan:{s['scan']}s | min_score:{s['min_score']} | cooldown:{s['cooldown']}m | entry:{CFG.entry_mode}")
+    await ctx.reply(f"scan:{s['scan']}s | min_score:{s['min_score']} | cooldown:{s['cooldown']}m")
 
 # ---- CSV/Stats Commands ----
 def _tail_csv(path: Path, n: int = 10) -> List[dict]:
@@ -1544,7 +1382,7 @@ async def sheetping_cmd(ctx):
 async def help_command(ctx):
     cmds = [
         "**Core:** !version, !status, !ping, !mute, !unmute",
-        "**Modes:** !mode <testing|level1|level2|level3>, !showmode, !entrymode <hybrid|breakout|both>",
+        "**Modes:** !mode <testing|level1|level2|level3>, !showmode",
         "**Trades:** !active, !exits, !close <id> <price>, !result <id> <price> [notes]",
         "**Analysis:** !market, !why, !debug, !stats",
         "**Data:** !csvstats, !lastalerts [n], !lastfills [n], !exportday [YYYY-MM-DD|today]",
@@ -1565,7 +1403,6 @@ def _health():
         "scan": CFG.scan_every_seconds,
         "min_score": CFG.min_score,
         "cooldown": CFG.cooldown_minutes,
-        "entry_mode": CFG.entry_mode,
         "system_health": get_system_health_emoji(),
         "last_successful_fetch": _last_successful_fetch.isoformat() if _last_successful_fetch else None,
         "last_fetch_error": _last_fetch_error
@@ -1579,8 +1416,7 @@ def _metrics():
         "metrics": s,
         "active_trades": len(tm.active),
         "hours_since_signal": hours_since_last_signal(),
-        "system_health": get_system_health_emoji(),
-        "entry_mode": CFG.entry_mode
+        "system_health": get_system_health_emoji()
     })
 
 def run_flask():
