@@ -1,5 +1,5 @@
 # ===============================================
-# Scout Tower - Enhanced ETH Alert Bot v3.5.2
+# Scout Tower - Enhanced ETH Alert Bot v3.5.3
 # - Bias: Donchian midline (directional bias)
 # - Triggers: EMA20/50 crossover OR RSI momentum burst (inside bias)
 # - Confluence Scoring: EMA trend, RSI, VWAP, Candle body + (NEW) MACD hist, Volume spike,
@@ -32,7 +32,7 @@ from discord.ext import tasks, commands
 
 from flask import Flask, jsonify
 
-VERSION = "3.4.3"
+VERSION = "3.5.3"
 
 # ---------------- Logging ----------------
 logging.basicConfig(
@@ -1664,7 +1664,7 @@ async def help_command(ctx):
         "**Core:** !version, !status, !ping, !mute, !unmute",
         "**Modes:** !mode <testing|level1|level2|level3>, !showmode",
         "**Trades:** !active, !exits, !close <id> <price>, !result <id> <price> [notes]",
-        "**Analysis:** !market, !why, !debug, !stats",
+        "**Analysis:** !market, !why, !debug, !stats, !signals, !confluence",  # Added new commands
         "**Data:** !csvstats, !lastalerts [n], !lastfills [n], !exportday [YYYY-MM-DD|today]",
         "**Sheets:** !testsheets, !checksheets, !rehydrate, !getcsv, !pushtosheet, !sheetping",
     ]
