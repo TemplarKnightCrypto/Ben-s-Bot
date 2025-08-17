@@ -1,5 +1,5 @@
 # ===============================================
-# Scout Tower - Enhanced ETH Alert Bot v3.5.0 (Hybrid Triggers)
+# Scout Tower - Enhanced ETH Alert Bot v3.5.1 (Hybrid Triggers)
 # - Bias: Donchian midline (directional bias)
 # - Triggers: EMA20/50 crossover OR RSI momentum burst (inside bias)
 # - Confluence Scoring: EMA trend, RSI, VWAP, Candle body + (NEW) MACD hist, Volume spike,
@@ -30,7 +30,7 @@ from discord.ext import tasks, commands
 
 from flask import Flask, jsonify
 
-VERSION = "3.5.0"
+VERSION = "3.5.1"
 
 # ---------------- Logging ----------------
 logging.basicConfig(
@@ -105,6 +105,9 @@ class Config:
 
     # Entry mode: 'hybrid' (bias + EMA/RSI triggers), 'breakout' (Donchian close), 'both'
     entry_mode: str = field(default_factory=lambda: os.getenv("ENTRY_MODE","hybrid").strip().lower())
+
+        # Dual timeframe
+    trigger_interval: str = field(default_factory=lambda: os.getenv("TRIGGER_INTERVAL","15m"))
 
     # HTTP
     port: int = field(default_factory=lambda: int(os.getenv("PORT","10000") or 10000))
@@ -333,7 +336,7 @@ def check_signal_drought() -> Optional[str]:
 
 async def market_analysis_report() -> str:
     """Why no signals? Market analysis"""
-    df = await md.fetch_ohlc(limit=100)
+    df = await md_price.fetch_ohlc(limit=100)
     if df is None:
         return "⚠️ **DATA ISSUE**: Cannot fetch market data"
     
@@ -909,7 +912,7 @@ async def create_online_embed() -> discord.Embed:
     
     # Add market context
     try:
-        df = await md.fetch_ohlc(limit=50)
+        df = await md_price.fetch_ohlc(limit=50)
         if df is not None and not df.empty:
             current_price = df["close"].iloc[-1]
             idx = -min(24, len(df)-1)
@@ -932,7 +935,7 @@ async def create_online_embed() -> discord.Embed:
         value=f"""Mode: {mode_emoji.get(current_mode, '⚪')} **{current_mode.upper()}**
 Provider: {CFG.provider.upper()} {data_health}
 Scan: {CFG.scan_every_seconds}s | Score: {CFG.min_score} | Cooldown: {CFG.cooldown_minutes}m
-Entry Mode: **{CFG.entry_mode.upper()}**""",
+Entry Mode: **{CFG.entry_mode.upper()}** | Trigger TF: **{CFG.trigger_interval}** | Price TF: **{CFG.interval}**""",
         inline=False
     )
     
@@ -965,7 +968,7 @@ async def create_status_embed() -> discord.Embed:
     
     # Market Overview Section
     try:
-        df = await md.fetch_ohlc(limit=100)
+        df = await md_price.fetch_ohlc(limit=100)
         if df is not None and not df.empty:
             df = add_indicators(df)
             current = df.iloc[-1]
@@ -1085,7 +1088,8 @@ async def create_status_embed() -> discord.Embed:
     return embed
 
 # ---------------- Global Singletons ----------------
-md = MarketData(CFG.pair, CFG.interval)
+md_price = MarketData(CFG.pair, CFG.interval)
+md_trigger = MarketData(CFG.pair, CFG.trigger_interval)
 sheets = GoogleSheetsIntegration(CFG.sheets_webhook, CFG.sheets_token)
 tm = TradeManager(CFG, sheets)
 attach_metrics(tm)
@@ -1108,7 +1112,7 @@ async def heartbeat_report():
             if ch:
                 last_signal_ago = "Never" if not _last_alert_time else f"{(utc_now() - _last_alert_time).total_seconds()//60:.0f}m ago"
                 
-                df = await md.fetch_ohlc(limit=50)
+                df = await md_price.fetch_ohlc(limit=50)
                 current_price = df["close"].iloc[-1] if df is not None and not df.empty else "Unknown"
                 
                 embed = discord.Embed(
@@ -1131,7 +1135,7 @@ async def heartbeat_report():
 async def data_quality_check():
     """Monitor for data issues"""
     try:
-        df = await md.fetch_ohlc(limit=10)
+        df = await md_price.fetch_ohlc(limit=10)
         if df is None:
             await send_error_alert("⚠️ **DATA FAILURE**: Cannot fetch OHLC data")
             return
@@ -1170,6 +1174,7 @@ async def smart_status_update():
         except Exception as e:
             log.error(f"Smart status update error: {e}")
 
+
 @tasks.loop(seconds=5)
 async def scanner():
     global _last_alert_time
@@ -1179,19 +1184,27 @@ async def scanner():
         if _last_alert_time and (now - _last_alert_time).total_seconds() < CFG.scan_every_seconds:
             return
 
-        df = await md.fetch_ohlc(limit=250)
-        if df is None or df.empty: return
-        df = df.rename(columns={"open":"open","high":"high","low":"low","close":"close","volume":"volume"})
-        df["open"] = df["open"].astype(float)
-        df["high"] = df["high"].astype(float)
-        df["low"]  = df["low"].astype(float)
-        df["close"]= df["close"].astype(float)
-        df["volume"]=df["volume"].astype(float)
-        df = add_indicators(df)
+        # Fetch price (1m or CFG.interval) and trigger frame (15m by default)
+        df_price = await md_price.fetch_ohlc(limit=300)
+        df_trig  = await md_trigger.fetch_ohlc(limit=300)
+        if df_price is None or df_price.empty or df_trig is None or df_trig.empty:
+            return
 
-        price_now = float(df["close"].iloc[-1])
-        
-        # Check for exits on active trades first
+        # Clean and compute indicators on TRIGGER frame only
+        for df in (df_price, df_trig):
+            df.rename(columns={"open":"open","high":"high","low":"low","close":"close","volume":"volume"}, inplace=True)
+            df["open"] = df["open"].astype(float)
+            df["high"] = df["high"].astype(float)
+            df["low"]  = df["low"].astype(float)
+            df["close"]= df["close"].astype(float)
+            df["volume"]=df["volume"].astype(float)
+
+        df_trig = add_indicators(df_trig)
+
+        # Use 1m price for monitoring exits and for price_now
+        price_now = float(df_price["close"].iloc[-1])
+
+        # 1) Monitor exits on price timeframe
         if tm.active:
             exits = await tm.check_exits(price_now)
             for exit_info in exits:
@@ -1199,10 +1212,11 @@ async def scanner():
                     ch = bot.get_channel(CFG.signals_channel_id)
                     if ch:
                         await ch.send(embed=embed_trade_exit(exit_info))
-        
-        # Check for new signals
-        sig = generate_signal(df, price_now)
-        if not sig: return
+
+        # 2) Generate new signals from TRIGGER timeframe
+        sig = generate_signal(df_trig, price_now)
+        if not sig:
+            return
 
         # cooldown per side simple guard
         if _last_alert_time and (utc_now()-_last_alert_time).total_seconds() < CFG.cooldown_minutes*60:
@@ -1224,8 +1238,6 @@ async def scanner():
 
     except Exception as e:
         log.error(f"Scanner error: {e}")
-
-# ---------------- Discord Commands ----------------
 @bot.event
 async def on_ready():
     log.info(f"Discord logged in as {bot.user}")
@@ -1299,7 +1311,7 @@ async def exits_cmd(ctx):
     )
     
     try:
-        df = await md.fetch_ohlc(limit=5)
+        df = await md_price.fetch_ohlc(limit=5)
         current_price = df["close"].iloc[-1] if df is not None and not df.empty else 0
         embed.add_field(name="Current Price", value=f"${current_price:.2f}", inline=False)
     except:
@@ -1372,7 +1384,7 @@ async def exits_cmd(ctx):
 @bot.command(name="market")
 async def market_status(ctx):
     """Comprehensive market overview"""
-    df = await md.fetch_ohlc(limit=100)
+    df = await md_price.fetch_ohlc(limit=100)
     if df is None:
         return await ctx.reply("❌ Cannot fetch market data")
     
@@ -1410,11 +1422,12 @@ async def debug_status(ctx):
     info.append(f"Last successful fetch: {_last_successful_fetch}")
     info.append(f"Last fetch error: {_last_fetch_error}")
     info.append(f"Data provider: {CFG.provider}")
+    info.append(f"Price TF: {CFG.interval} | Trigger TF: {CFG.trigger_interval}")
     info.append(f"Entry mode: {CFG.entry_mode}")
     info.append(f"Active tasks: heartbeat={heartbeat_report.is_running()}, data_check={data_quality_check.is_running()}")
     
     try:
-        df = await md.fetch_ohlc(limit=5)
+        df = await md_price.fetch_ohlc(limit=5)
         info.append(f"Data fetch: ✅ Latest: {df.index[-1] if df is not None and not df.empty else 'Failed'}")
     except Exception as e:
         info.append(f"Data fetch: ❌ {str(e)}")
