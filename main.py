@@ -1287,7 +1287,7 @@ async def scanner():
         tm._last_signal_info = sig
         
         # Enhanced logging with trigger info - NEW
-        log.info(f"🎯 Signal: {sig['side']} | Score: {sig['score']:.1f} | Triggers: {', '.join(sig['triggers'])} | DC Mid: ${sig['dc_mid']:.2f} | Price vs Mid: {sig['price_vs_mid']}")
+        log.info(f"Signal: {sig['side']} | Score: {sig['score']:.1f} | Triggers: {', '.join(sig['triggers'])} | DC Mid: ${sig['dc_mid']:.2f} | Price vs Mid: {sig['price_vs_mid']}")
 
         t = await tm.open_trade(
             side=sig["side"],
@@ -1727,7 +1727,7 @@ async def test_connections():
             raise ValueError("Invalid Discord token")
         
         # Test market data with short timeout
-        df = await asyncio.wait_for(md_price.fetch_ohlc(limit=5), timeout=10.0)
+        df = await asyncio.wait_for(md.fetch_ohlc(limit=5), timeout=10.0)  # Fixed: md_price -> md
         if df is None or df.empty:
             raise ValueError("Cannot fetch market data")
         
