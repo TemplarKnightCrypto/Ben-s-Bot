@@ -1705,14 +1705,22 @@ def run_flask():
 # ---------------- Main ----------------
 def validate_environment():
     """Validate required environment variables"""
+    print("==> Checking required environment variables...")
+    
     required_vars = ['DISCORD_TOKEN']
     missing = [var for var in required_vars if not os.getenv(var)]
     
     if missing:
+        print(f"==> ERROR: Missing environment variables: {missing}")
         log.error(f"Missing required environment variables: {missing}")
         sys.exit(1)
     
+    # Show what we found
+    token = os.getenv('DISCORD_TOKEN', '')
+    print(f"==> DISCORD_TOKEN: {'✅ SET' if token else '❌ MISSING'} ({len(token)} chars)")
+    
     log.info("Environment validation passed")
+    print("==> Environment validation completed successfully")
 
 def signal_handler(sig, frame):
     """Graceful shutdown handler"""
@@ -1753,35 +1761,80 @@ def run_flask_safe():
 def main():
     """Main function with improved error handling and timeout protection"""
     
-    # Set up signal handlers for graceful shutdown
-    signal.signal(signal.SIGTERM, signal_handler)
-    signal.signal(signal.SIGINT, signal_handler)
-    
-    # Validate environment
-    validate_environment()
-    
-    # FORCE HYBRID MODE - Always run both Flask and Discord
-    log.info("Running in HYBRID mode (Discord + Flask)")
-    
-    # Start Flask in background
-    flask_thread = threading.Thread(target=run_flask_safe, daemon=True)
-    flask_thread.start()
-    
-    # Give Flask a moment to start
-    time.sleep(2)
-    
-    # Test connections before starting Discord bot
     try:
-        connections_ok = asyncio.run(test_connections())
-        if not connections_ok:
-            log.error("Connection tests failed - starting in degraded mode")
-    except Exception as e:
-        log.warning(f"Connection test error: {e} - continuing anyway")
-    
-    # Start Discord bot (this will keep the service running)
-    try:
+        print("==> Scout Tower v3.5.3 Starting...")
+        log.info("==> Scout Tower v3.5.3 Starting...")
+        
+        # Set up signal handlers for graceful shutdown
+        signal.signal(signal.SIGTERM, signal_handler)
+        signal.signal(signal.SIGINT, signal_handler)
+        print("==> Signal handlers configured")
+        
+        # Validate environment
+        print("==> Validating environment...")
+        log.info("==> Validating environment...")
+        validate_environment()
+        print("==> Environment validation passed")
+        
+        # Show configuration
+        print(f"==> Discord Token: {'SET' if CFG.token else 'MISSING'} ({len(CFG.token) if CFG.token else 0} chars)")
+        print(f"==> Port: {CFG.port}")
+        print(f"==> Provider: {CFG.provider}")
+        print(f"==> Pair: {CFG.pair}")
+        
+        # FORCE HYBRID MODE - Always run both Flask and Discord
+        print("==> Running in HYBRID mode (Discord + Flask)")
+        log.info("Running in HYBRID mode (Discord + Flask)")
+        
+        # Start Flask in background
+        print("==> Starting Flask server...")
+        log.info("==> Starting Flask server...")
+        flask_thread = threading.Thread(target=run_flask_safe, daemon=True)
+        flask_thread.start()
+        print("==> Flask thread started")
+        
+        # Give Flask a moment to start
+        print("==> Waiting for Flask to initialize...")
+        time.sleep(3)
+        print("==> Flask should be ready")
+        
+        # Test connections before starting Discord bot
+        print("==> Testing connections...")
+        try:
+            connections_ok = asyncio.run(test_connections())
+            if not connections_ok:
+                print("==> WARNING: Connection tests failed - starting in degraded mode")
+                log.error("Connection tests failed - starting in degraded mode")
+            else:
+                print("==> Connection tests passed")
+        except Exception as e:
+            print(f"==> WARNING: Connection test error: {e} - continuing anyway")
+            log.warning(f"Connection test error: {e} - continuing anyway")
+        
+        # Start Discord bot (this will keep the service running)
+        print("==> Starting Discord bot...")
         log.info("Starting Discord bot...")
+        
+        # Validate token one more time
+        if not CFG.token:
+            raise ValueError("Discord token is empty")
+        if len(CFG.token) < 50:
+            raise ValueError(f"Discord token seems invalid (only {len(CFG.token)} characters)")
+        
+        print(f"==> Token validated, connecting to Discord...")
         bot.run(CFG.token)
+        
+    except KeyboardInterrupt:
+        print("==> Received keyboard interrupt, shutting down...")
+        log.info("Received keyboard interrupt")
+        sys.exit(0)
     except Exception as e:
-        log.error(f"Discord bot error: {e}")
+        print(f"==> FATAL ERROR in main(): {e}")
+        log.error(f"FATAL ERROR in main(): {e}")
+        import traceback
+        print("==> Full traceback:")
+        traceback.print_exc()
         sys.exit(1)
+
+if __name__ == "__main__":
+    main()
