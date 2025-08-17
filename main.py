@@ -1760,46 +1760,25 @@ def main():
     # Validate environment
     validate_environment()
     
-    # Check if running on Render web service
-    if os.getenv("RENDER_SERVICE_TYPE") == "web":
-        log.info("Running in web service mode (Flask only)")
-        run_flask_safe()
-        return
-    
-    # For background service or local development
-    log.info("Running in bot mode (Discord + Flask)")
+    # FORCE HYBRID MODE - Always run both Flask and Discord
+    log.info("Running in HYBRID mode (Discord + Flask)")
     
     # Start Flask in background
     flask_thread = threading.Thread(target=run_flask_safe, daemon=True)
     flask_thread.start()
     
-    # Wait for Flask to start with timeout
-    flask_ready = False
-    for i in range(10):  # Try for 10 seconds
-        try:
-            response = requests.get(f"http://localhost:{CFG.port}/health", timeout=1)
-            if response.status_code == 200:
-                log.info("Flask server is ready")
-                flask_ready = True
-                break
-        except:
-            time.sleep(1)
-    
-    if not flask_ready:
-        log.error("Flask failed to start within timeout")
-        sys.exit(1)
+    # Give Flask a moment to start
+    time.sleep(2)
     
     # Test connections before starting Discord bot
     try:
-        # Use asyncio.run for connection test
         connections_ok = asyncio.run(test_connections())
         if not connections_ok:
             log.error("Connection tests failed - starting in degraded mode")
-            # Continue anyway for Render deployment
     except Exception as e:
         log.warning(f"Connection test error: {e} - continuing anyway")
     
-    # Start Discord bot
+    # Start Discord bot (this will keep the service running)
     try:
         log.info("Starting Discord bot...")
         bot.run(CFG.token)
