@@ -16,6 +16,8 @@ from dataclasses import dataclass, field, asdict
 from typing import Optional, Dict, Any, List, Tuple
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
+import signal
+import requests
 
 import aiohttp
 import numpy as np
@@ -1423,13 +1425,106 @@ def run_flask():
     app.run(host="0.0.0.0", port=CFG.port, debug=False)
 
 # ---------------- Main ----------------
-def main():
-    threading.Thread(target=run_flask, daemon=True).start()
-    token = CFG.token
-    if not token:
-        log.error("DISCORD_TOKEN missing.")
-        return
-    bot.run(token)
+def validate_environment():
+    """Validate required environment variables"""
+    required_vars = ['DISCORD_TOKEN']
+    missing = [var for var in required_vars if not os.getenv(var)]
+    
+    if missing:
+        log.error(f"Missing required environment variables: {missing}")
+        sys.exit(1)
+    
+    log.info("Environment validation passed")
 
-if __name__ == "__main__":
-    main()
+def signal_handler(sig, frame):
+    """Graceful shutdown handler"""
+    log.info("Graceful shutdown initiated...")
+    sys.exit(0)
+
+async def test_connections():
+    """Test external connections with timeout"""
+    try:
+        # Test Discord token validity (quick check)
+        if not CFG.token or len(CFG.token) < 50:
+            raise ValueError("Invalid Discord token")
+        
+        # Test market data with short timeout
+        df = await asyncio.wait_for(md_price.fetch_ohlc(limit=5), timeout=10.0)
+        if df is None or df.empty:
+            raise ValueError("Cannot fetch market data")
+        
+        log.info("Connection tests passed")
+        return True
+        
+    except asyncio.TimeoutError:
+        log.error("Connection test timeout")
+        return False
+    except Exception as e:
+        log.error(f"Connection test failed: {e}")
+        return False
+
+def run_flask_safe():
+    """Run Flask with error handling"""
+    try:
+        log.info(f"Starting Flask server on port {CFG.port}")
+        app.run(host="0.0.0.0", port=CFG.port, debug=False)
+    except Exception as e:
+        log.error(f"Flask startup error: {e}")
+        sys.exit(1)
+
+def main():
+    """Main function with improved error handling and timeout protection"""
+    
+    # Set up signal handlers for graceful shutdown
+    signal.signal(signal.SIGTERM, signal_handler)
+    signal.signal(signal.SIGINT, signal_handler)
+    
+    # Validate environment
+    validate_environment()
+    
+    # Check if running on Render web service
+    if os.getenv("RENDER_SERVICE_TYPE") == "web":
+        log.info("Running in web service mode (Flask only)")
+        run_flask_safe()
+        return
+    
+    # For background service or local development
+    log.info("Running in bot mode (Discord + Flask)")
+    
+    # Start Flask in background
+    flask_thread = threading.Thread(target=run_flask_safe, daemon=True)
+    flask_thread.start()
+    
+    # Wait for Flask to start with timeout
+    flask_ready = False
+    for i in range(10):  # Try for 10 seconds
+        try:
+            response = requests.get(f"http://localhost:{CFG.port}/health", timeout=1)
+            if response.status_code == 200:
+                log.info("Flask server is ready")
+                flask_ready = True
+                break
+        except:
+            time.sleep(1)
+    
+    if not flask_ready:
+        log.error("Flask failed to start within timeout")
+        sys.exit(1)
+    
+    # Test connections before starting Discord bot
+    try:
+        # Use asyncio.run for connection test
+        connections_ok = asyncio.run(test_connections())
+        if not connections_ok:
+            log.error("Connection tests failed - starting in degraded mode")
+            # Continue anyway for Render deployment
+    except Exception as e:
+        log.warning(f"Connection test error: {e} - continuing anyway")
+    
+    # Start Discord bot
+    try:
+        log.info("Starting Discord bot...")
+        bot.run(CFG.token)
+    except Exception as e:
+        log.error(f"Discord bot error: {e}")
+        sys.exit(1)
