@@ -1,5 +1,5 @@
 # ===============================================
-# Scout Tower - Enhanced ETH Alert Bot v3.5.3
+# Scout Tower - Enhanced ETH Alert Bot v3.5.4
 # - Bias: Donchian midline (directional bias)
 # - Triggers: EMA20/50 crossover OR RSI momentum burst (inside bias)
 # - Confluence Scoring: EMA trend, RSI, VWAP, Candle body + (NEW) MACD hist, Volume spike,
@@ -32,7 +32,7 @@ from discord.ext import tasks, commands
 
 from flask import Flask, jsonify
 
-VERSION = "3.5.3"
+VERSION = "3.5.4"
 
 # ---------------- Logging ----------------
 logging.basicConfig(
@@ -472,12 +472,32 @@ class TradeManager:
         t.rr2 = rr((zone_lo+zone_hi)/2.0, sl, tp2)
         self.active[t.id] = t
 
-        append_csv(ALERTS_CSV, {
+        # Enhanced CSV logging with all signal data
+        csv_data = {
             "id": t.id, "time": t.opened_at, "pair": t.pair, "side": t.side,
             "zone_lo": t.zone_lo, "zone_hi": t.zone_hi, "sl": t.sl, "tp1": t.tp1, "tp2": t.tp2,
             "rr1": t.rr1, "rr2": t.rr2
-        })
-        asyncio.create_task(self.sheets.post({"action":"entry", **asdict(t)}))
+        }
+        
+        # Add signal info if available
+        if hasattr(self, '_last_signal_info') and self._last_signal_info:
+            sig = self._last_signal_info
+            csv_data.update({
+                "score": sig.get('score', ''),
+                "triggers": ','.join(sig.get('triggers', [])),
+                "bias_source": sig.get('bias_source', ''),
+                "dc_mid": sig.get('dc_mid', ''),
+                "price_vs_mid": sig.get('price_vs_mid', '')
+            })
+        
+        append_csv(ALERTS_CSV, csv_data)
+        
+        # Enhanced Sheets data
+        sheets_data = {"action": "entry", **asdict(t)}
+        if hasattr(self, '_last_signal_info') and self._last_signal_info:
+            sheets_data.update(self._last_signal_info)
+        
+        asyncio.create_task(self.sheets.post(sheets_data))
         return t
 
     async def close_trade(self, trade_id: str, exit_price: float, reason: str = "manual", exit_type: str = "MANUAL"):
@@ -494,109 +514,129 @@ class TradeManager:
         return True
 
     async def check_exits(self, current_price: float) -> List[dict]:
-            """Check all active trades for exit conditions"""
-            exits = []
-            trades_to_close = []
+        """Check all active trades for exit conditions with enhanced TP1→SL tracking"""
+        exits = []
+        trades_to_close = []
+        
+        for trade in list(self.active.values()):
+            exit_info = None
             
-            for trade in list(self.active.values()):
-                exit_info = None
+            if trade.side == "LONG":
+                # Check entry confirmation
+                if not trade.entry_confirmed and trade.zone_lo <= current_price <= trade.zone_hi:
+                    trade.entry_confirmed = True
+                    trade.entry = current_price
+                    exit_info = {
+                        "trade": trade,
+                        "type": "ENTRY",
+                        "price": current_price,
+                        "message": f"📍 Entry confirmed in zone"
+                    }
                 
-                if trade.side == "LONG":
-                    # Check entry confirmation
-                    if not trade.entry_confirmed and trade.zone_lo <= current_price <= trade.zone_hi:
-                        trade.entry_confirmed = True
-                        trade.entry = current_price
-                        exit_info = {
-                            "trade": trade,
-                            "type": "ENTRY",
-                            "price": current_price,
-                            "message": f"📍 Entry confirmed in zone"
-                        }
-                    
-                    # Check stop loss
-                    elif trade.entry_confirmed and not trade.sl_hit and current_price <= trade.sl:
-                        trade.sl_hit = True
-                        trades_to_close.append((trade.id, current_price, "SL hit", "SL"))
-                        exit_info = {
-                            "trade": trade,
-                            "type": "SL",
-                            "price": current_price,
-                            "message": f"🔴 Stop Loss Hit"
-                        }
-                    
-                    # Check TP1
-                    elif trade.entry_confirmed and not trade.tp1_hit and current_price >= trade.tp1:
-                        trade.tp1_hit = True
-                        exit_info = {
-                            "trade": trade,
-                            "type": "TP1",
-                            "price": current_price,
-                            "message": f"🎯 Take Profit 1 Hit"
-                        }
-                    
-                    # Check TP2
-                    elif trade.entry_confirmed and not trade.tp2_hit and current_price >= trade.tp2:
-                        trade.tp2_hit = True
-                        trades_to_close.append((trade.id, current_price, "TP2 hit", "TP2"))
-                        exit_info = {
-                            "trade": trade,
-                            "type": "TP2",
-                            "price": current_price,
-                            "message": f"🎯 Take Profit 2 Hit"
-                        }
+                # Check stop loss (with TP1 history)
+                elif trade.entry_confirmed and not trade.sl_hit and current_price <= trade.sl:
+                    trade.sl_hit = True
+                    # Enhanced exit reason based on TP1 status
+                    if trade.tp1_hit:
+                        reason = "TP1 hit then SL"
+                        exit_type = "TP1_THEN_SL"
+                        message = "🔴 Stop Loss Hit (after TP1)"
+                    else:
+                        reason = "SL hit"
+                        exit_type = "SL"
+                        message = "🔴 Stop Loss Hit"
+                        
+                    trades_to_close.append((trade.id, current_price, reason, exit_type))
+                    exit_info = {
+                        "trade": trade,
+                        "type": "SL",
+                        "price": current_price,
+                        "message": message
+                    }
                 
-                elif trade.side == "SHORT":
-                    # Check entry confirmation
-                    if not trade.entry_confirmed and trade.zone_lo <= current_price <= trade.zone_hi:
-                        trade.entry_confirmed = True
-                        trade.entry = current_price
-                        exit_info = {
-                            "trade": trade,
-                            "type": "ENTRY",
-                            "price": current_price,
-                            "message": f"📍 Entry confirmed in zone"
-                        }
-                    
-                    # Check stop loss
-                    elif trade.entry_confirmed and not trade.sl_hit and current_price >= trade.sl:
-                        trade.sl_hit = True
-                        trades_to_close.append((trade.id, current_price, "SL hit", "SL"))
-                        exit_info = {
-                            "trade": trade,
-                            "type": "SL",
-                            "price": current_price,
-                            "message": f"🔴 Stop Loss Hit"
-                        }
-                    
-                    # Check TP1
-                    elif trade.entry_confirmed and not trade.tp1_hit and current_price <= trade.tp1:
-                        trade.tp1_hit = True
-                        exit_info = {
-                            "trade": trade,
-                            "type": "TP1",
-                            "price": current_price,
-                            "message": f"🎯 Take Profit 1 Hit"
-                        }
-                    
-                    # Check TP2
-                    elif trade.entry_confirmed and not trade.tp2_hit and current_price <= trade.tp2:
-                        trade.tp2_hit = True
-                        trades_to_close.append((trade.id, current_price, "TP2 hit", "TP2"))
-                        exit_info = {
-                            "trade": trade,
-                            "type": "TP2",
-                            "price": current_price,
-                            "message": f"🎯 Take Profit 2 Hit"
-                        }
+                # Check TP1
+                elif trade.entry_confirmed and not trade.tp1_hit and current_price >= trade.tp1:
+                    trade.tp1_hit = True
+                    exit_info = {
+                        "trade": trade,
+                        "type": "TP1",
+                        "price": current_price,
+                        "message": f"🎯 Take Profit 1 Hit"
+                    }
                 
-                if exit_info:
-                    exits.append(exit_info)
+                # Check TP2
+                elif trade.entry_confirmed and not trade.tp2_hit and current_price >= trade.tp2:
+                    trade.tp2_hit = True
+                    trades_to_close.append((trade.id, current_price, "TP2 hit", "TP2"))
+                    exit_info = {
+                        "trade": trade,
+                        "type": "TP2",
+                        "price": current_price,
+                        "message": f"🎯 Take Profit 2 Hit"
+                    }
             
-            # Close trades that hit final exits
-            for trade_id, price, reason, exit_type in trades_to_close:
-                await self.close_trade(trade_id, price, reason, exit_type)
+            elif trade.side == "SHORT":
+                # Check entry confirmation
+                if not trade.entry_confirmed and trade.zone_lo <= current_price <= trade.zone_hi:
+                    trade.entry_confirmed = True
+                    trade.entry = current_price
+                    exit_info = {
+                        "trade": trade,
+                        "type": "ENTRY",
+                        "price": current_price,
+                        "message": f"📍 Entry confirmed in zone"
+                    }
+                
+                # Check stop loss (with TP1 history)
+                elif trade.entry_confirmed and not trade.sl_hit and current_price >= trade.sl:
+                    trade.sl_hit = True
+                    # Enhanced exit reason based on TP1 status
+                    if trade.tp1_hit:
+                        reason = "TP1 hit then SL"
+                        exit_type = "TP1_THEN_SL"
+                        message = "🔴 Stop Loss Hit (after TP1)"
+                    else:
+                        reason = "SL hit"
+                        exit_type = "SL"
+                        message = "🔴 Stop Loss Hit"
+                        
+                    trades_to_close.append((trade.id, current_price, reason, exit_type))
+                    exit_info = {
+                        "trade": trade,
+                        "type": "SL",
+                        "price": current_price,
+                        "message": message
+                    }
+                
+                # Check TP1
+                elif trade.entry_confirmed and not trade.tp1_hit and current_price <= trade.tp1:
+                    trade.tp1_hit = True
+                    exit_info = {
+                        "trade": trade,
+                        "type": "TP1",
+                        "price": current_price,
+                        "message": f"🎯 Take Profit 1 Hit"
+                    }
+                
+                # Check TP2
+                elif trade.entry_confirmed and not trade.tp2_hit and current_price <= trade.tp2:
+                    trade.tp2_hit = True
+                    trades_to_close.append((trade.id, current_price, "TP2 hit", "TP2"))
+                    exit_info = {
+                        "trade": trade,
+                        "type": "TP2",
+                        "price": current_price,
+                        "message": f"🎯 Take Profit 2 Hit"
+                    }
             
-            return exits
+            if exit_info:
+                exits.append(exit_info)
+        
+        # Close trades that hit final exits
+        for trade_id, price, reason, exit_type in trades_to_close:
+            await self.close_trade(trade_id, price, reason, exit_type)
+        
+        return exits
 
     def snapshot_active(self) -> List[dict]:
         out = []
