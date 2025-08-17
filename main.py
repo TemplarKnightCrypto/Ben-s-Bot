@@ -1,13 +1,17 @@
 # ===============================================
-# Scout Tower - Enhanced ETH Alert Bot v3.4.3
-# - Engine: Donchian breakout + EMA trend + RSI/VWAP/ATR filters
+# Scout Tower - Enhanced ETH Alert Bot v3.5.2
+# - Bias: Donchian midline (directional bias)
+# - Triggers: EMA20/50 crossover OR RSI momentum burst (inside bias)
+# - Confluence Scoring: EMA trend, RSI, VWAP, Candle body + (NEW) MACD hist, Volume spike,
+#                       Stoch RSI burst, VWAP bounce cross, ATR expansion
+# - Legacy Breakout: Optional Donchian close-based entries (configurable)
 # - Zones: Entry band, SL/TP from ATR + structure
 # - Providers: Binance primary, Kraken fallback
 # - Discord: commands (modes, stats, csv, active/close/result, sheets utils)
 # - Sheets: webhook write + rehydrate of open alerts
 # - CSV: alerts.csv / decisions.csv / fills.csv
 # - Flask: /health and /metrics
-# - ENHANCED: Heartbeat reports, market analysis, visual health indicators
+# - Heartbeat, data quality checks, smart status updates
 # - EXIT ALERTS: Automatic TP1/TP2/SL detection and alerts
 # ===============================================
 
@@ -119,6 +123,24 @@ def rsi(series: pd.Series, n: int = 14) -> pd.Series:
     out = 100.0 - (100.0/(1.0+rs))
     return out.bfill().fillna(50.0)
 
+def stoch_rsi(series: pd.Series, n: int = 14, k: int = 3, d: int = 3) -> Tuple[pd.Series, pd.Series]:
+    """Stochastic RSI oscillator"""
+    rsi_vals = rsi(series, n)
+    stoch_rsi = (rsi_vals - rsi_vals.rolling(n).min()) / (rsi_vals.rolling(n).max() - rsi_vals.rolling(n).min()) * 100
+    stoch_rsi = stoch_rsi.fillna(50)
+    k_line = stoch_rsi.rolling(k).mean()
+    d_line = k_line.rolling(d).mean()
+    return k_line.fillna(50), d_line.fillna(50)
+
+def macd(series: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9) -> Tuple[pd.Series, pd.Series, pd.Series]:
+    """MACD oscillator"""
+    ema_fast = ema(series, fast)
+    ema_slow = ema(series, slow)
+    macd_line = ema_fast - ema_slow
+    signal_line = ema(macd_line, signal)
+    histogram = macd_line - signal_line
+    return macd_line, signal_line, histogram
+
 def atr(df: pd.DataFrame, n: int = 14) -> pd.Series:
     h, l, c = df["high"], df["low"], df["close"]
     tr = np.maximum(h - l, np.maximum(abs(h - c.shift(1)), abs(l - c.shift(1))))
@@ -129,21 +151,48 @@ def vwap(df: pd.DataFrame) -> pd.Series:
     vol = df["volume"].cumsum().replace(0, np.nan)
     return (pv / vol).fillna(df["close"])
 
-def donchian(df: pd.DataFrame, n: int = 20) -> Tuple[pd.Series, pd.Series]:
+def donchian(df: pd.DataFrame, n: int = 20) -> Tuple[pd.Series, pd.Series, pd.Series]:
+    """Enhanced Donchian with midline"""
     dc_u = df["high"].rolling(n).max()
     dc_l = df["low"].rolling(n).min()
-    return dc_u, dc_l
+    dc_mid = (dc_u + dc_l) / 2.0
+    return dc_u, dc_l, dc_mid
 
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    """Add all indicators including new confluence factors"""
     df = df.copy()
+    
+    # Core indicators
     df["ema20"] = ema(df["close"], 20)
     df["ema50"] = ema(df["close"], 50)
-    df["rsi"]   = rsi(df["close"], 14)
-    df["atr"]   = atr(df, 14)
-    df["vwap"]  = vwap(df)
-    dc_u, dc_l  = donchian(df, 20)
-    df["dc_u"], df["dc_l"] = dc_u, dc_l
+    df["rsi"] = rsi(df["close"], 14)
+    df["atr"] = atr(df, 14)
+    df["vwap"] = vwap(df)
+    
+    # Enhanced Donchian with midline
+    dc_u, dc_l, dc_mid = donchian(df, 20)
+    df["dc_u"], df["dc_l"], df["dc_mid"] = dc_u, dc_l, dc_mid
+    
+    # New confluence indicators
+    macd_line, macd_signal, macd_hist = macd(df["close"])
+    df["macd"] = macd_line
+    df["macd_signal"] = macd_signal
+    df["macd_hist"] = macd_hist
+    
+    stoch_k, stoch_d = stoch_rsi(df["close"])
+    df["stoch_rsi_k"] = stoch_k
+    df["stoch_rsi_d"] = stoch_d
+    
+    # Volume analysis
+    df["volume_sma"] = df["volume"].rolling(20).mean()
+    df["volume_ratio"] = df["volume"] / df["volume_sma"]
+    
+    # ATR expansion (current ATR vs historical average)
+    df["atr_sma"] = df["atr"].rolling(10).mean()
+    df["atr_expansion"] = df["atr"] / df["atr_sma"]
+    
     return df
+
 # ---------------- Market Data Providers ----------------
 # Global tracking for health monitoring
 _last_successful_fetch: Optional[datetime] = None
@@ -638,51 +687,201 @@ def current_mode_snapshot() -> dict:
     }
 
 # ---------------- Signal Engine ----------------
-def score_signal(df: pd.DataFrame, i: int, side: str) -> float:
+def detect_bias(df: pd.DataFrame, i: int) -> Optional[str]:
+    """Determine market bias using Donchian midline"""
     row = df.iloc[i]
-    ema_trend = (row["ema20"] > row["ema50"]) if side=="LONG" else (row["ema20"] < row["ema50"])
-    rsi_ok = (row["rsi"] > 45) if side=="LONG" else (row["rsi"] < 55)
-    vwap_ok = (row["close"] >= row["vwap"]) if side=="LONG" else (row["close"] <= row["vwap"])
+    
+    if pd.isna(row["dc_mid"]):
+        return None
+        
+    if row["close"] >= row["dc_mid"]:
+        return "LONG"
+    elif row["close"] <= row["dc_mid"]:
+        return "SHORT"
+    
+    return None
 
-    base = 0.0
-    base += 1.0 if ema_trend else 0.0
-    base += 0.7 if rsi_ok else 0.0
-    base += 0.7 if vwap_ok else 0.0
-    # candle body quality
+def detect_ema_crossover(df: pd.DataFrame, i: int, bias: str) -> bool:
+    """Detect EMA crossover in bias direction"""
+    if i < 1:
+        return False
+        
+    current = df.iloc[i]
+    previous = df.iloc[i-1]
+    
+    if bias == "LONG":
+        return (current["ema20"] > current["ema50"] and 
+                previous["ema20"] <= previous["ema50"])
+    elif bias == "SHORT":
+        return (current["ema20"] < current["ema50"] and 
+                previous["ema20"] >= previous["ema50"])
+    
+    return False
+
+def detect_rsi_burst(df: pd.DataFrame, i: int, bias: str) -> bool:
+    """Detect RSI momentum burst"""
+    if i < 1:
+        return False
+        
+    current = df.iloc[i]
+    previous = df.iloc[i-1]
+    
+    if bias == "LONG":
+        return (current["rsi"] > 55 and previous["rsi"] <= 55)
+    elif bias == "SHORT":
+        return (current["rsi"] < 45 and previous["rsi"] >= 45)
+    
+    return False
+
+def score_signal(df: pd.DataFrame, i: int, side: str) -> float:
+    """Enhanced scoring with confluence factors"""
+    if i < 1:
+        return 0.0
+        
+    row = df.iloc[i]
+    prev_row = df.iloc[i-1]
+    score = 0.0
+    
+    # Base trend alignment (core requirement)
+    ema_trend = (row["ema20"] > row["ema50"]) if side == "LONG" else (row["ema20"] < row["ema50"])
+    score += 1.2 if ema_trend else 0.0
+    
+    # RSI positioning
+    if side == "LONG":
+        if row["rsi"] > 55:
+            score += 0.8
+        elif row["rsi"] > 45:
+            score += 0.4
+    else:
+        if row["rsi"] < 45:
+            score += 0.8
+        elif row["rsi"] < 55:
+            score += 0.4
+    
+    # VWAP alignment
+    vwap_ok = (row["close"] >= row["vwap"]) if side == "LONG" else (row["close"] <= row["vwap"])
+    score += 0.6 if vwap_ok else 0.0
+    
+    # Candle body strength
     body = abs(row["close"] - row["open"])
-    rng  = row["high"] - row["low"]
-    body_ok = (body >= 0.5 * rng) if rng > 0 else False
-    base += 0.6 if body_ok else 0.0
-    return round(base, 2)
+    candle_range = row["high"] - row["low"]
+    body_strength = (body / candle_range) if candle_range > 0 else 0
+    score += 0.5 if body_strength >= 0.6 else 0.0
+    
+    # === NEW CONFLUENCE FACTORS ===
+    
+    # MACD histogram flip
+    if not pd.isna(row["macd_hist"]) and not pd.isna(prev_row["macd_hist"]):
+        if side == "LONG":
+            if row["macd_hist"] > 0 and prev_row["macd_hist"] <= 0:
+                score += 0.7
+            elif row["macd_hist"] > prev_row["macd_hist"]:
+                score += 0.3
+        else:
+            if row["macd_hist"] < 0 and prev_row["macd_hist"] >= 0:
+                score += 0.7
+            elif row["macd_hist"] < prev_row["macd_hist"]:
+                score += 0.3
+    
+    # Volume spike
+    if not pd.isna(row["volume_ratio"]):
+        if row["volume_ratio"] > 2.0:
+            score += 0.8
+        elif row["volume_ratio"] > 1.5:
+            score += 0.4
+    
+    # Stochastic RSI burst
+    if not pd.isna(row["stoch_rsi_k"]) and not pd.isna(prev_row["stoch_rsi_k"]):
+        if side == "LONG":
+            if row["stoch_rsi_k"] > 20 and prev_row["stoch_rsi_k"] <= 20:
+                score += 0.6
+            elif row["stoch_rsi_k"] > 50 and prev_row["stoch_rsi_k"] <= 50:
+                score += 0.4
+        else:
+            if row["stoch_rsi_k"] < 80 and prev_row["stoch_rsi_k"] >= 80:
+                score += 0.6
+            elif row["stoch_rsi_k"] < 50 and prev_row["stoch_rsi_k"] >= 50:
+                score += 0.4
+    
+    # VWAP bounce/rejection
+    if not pd.isna(row["vwap"]):
+        if side == "LONG":
+            if row["low"] <= row["vwap"] * 1.001 and row["close"] > row["vwap"]:
+                score += 0.5
+        else:
+            if row["high"] >= row["vwap"] * 0.999 and row["close"] < row["vwap"]:
+                score += 0.5
+    
+    # ATR expansion (volatility increase)
+    if not pd.isna(row["atr_expansion"]):
+        if row["atr_expansion"] > 1.3:
+            score += 0.4
+        elif row["atr_expansion"] > 1.1:
+            score += 0.2
+    
+    return round(score, 2)
 
 def generate_signal(df: pd.DataFrame, price_now: float) -> Optional[dict]:
-    i = len(df)-1
+    """Hybrid signal generation with bias + triggers + confluence"""
+    if len(df) < 50:
+        return None
+        
+    i = len(df) - 1
     row = df.iloc[i]
-    # breakouts
-    if row["close"] > row["dc_u"] and row["ema20"] > row["ema50"]:
-        side = "LONG"
-        score = score_signal(df, i, side)
-        if score < CFG.min_score: return None
-        atrv = float(row["atr"])
-        level = float(row["dc_u"])
-        zone = (level*(1 - CFG.zone_bps/10000.0), level*(1 + CFG.zone_bps/10000.0))
-        sl = row["ema50"] - 0.5*atrv
-        tp1 = level + 1.5*atrv
-        tp2 = level + 3.0*atrv
-        return {"side": side, "zone": zone, "sl": float(sl), "tp1": float(tp1), "tp2": float(tp2), "score": score}
-
-    if row["close"] < row["dc_l"] and row["ema20"] < row["ema50"]:
-        side = "SHORT"
-        score = score_signal(df, i, side)
-        if score < CFG.min_score: return None
-        atrv = float(row["atr"])
-        level = float(row["dc_l"])
-        zone = (level*(1 - CFG.zone_bps/10000.0), level*(1 + CFG.zone_bps/10000.0))
-        sl = row["ema50"] + 0.5*atrv
-        tp1 = level - 1.5*atrv
-        tp2 = level - 3.0*atrv
-        return {"side": side, "zone": zone, "sl": float(sl), "tp1": float(tp1), "tp2": float(tp2), "score": score}
-    return None
+    
+    # Step 1: Determine bias using Donchian midline
+    bias = detect_bias(df, i)
+    if not bias:
+        return None
+    
+    # Step 2: Check for triggers (EMA crossover OR RSI burst)
+    ema_trigger = detect_ema_crossover(df, i, bias)
+    rsi_trigger = detect_rsi_burst(df, i, bias)
+    
+    if not (ema_trigger or rsi_trigger):
+        return None
+    
+    # Step 3: Score the signal with confluence factors
+    score = score_signal(df, i, bias)
+    
+    if score < CFG.min_score:
+        return None
+    
+    # Step 4: Calculate levels
+    atrv = float(row["atr"])
+    
+    if bias == "LONG":
+        zone_center = price_now
+        zone = (zone_center * (1 - CFG.zone_bps/10000.0), zone_center * (1 + CFG.zone_bps/10000.0))
+        sl = row["ema50"] - 0.5 * atrv
+        tp1 = price_now + 1.5 * atrv
+        tp2 = price_now + 3.0 * atrv
+    else:
+        zone_center = price_now
+        zone = (zone_center * (1 - CFG.zone_bps/10000.0), zone_center * (1 + CFG.zone_bps/10000.0))
+        sl = row["ema50"] + 0.5 * atrv
+        tp1 = price_now - 1.5 * atrv
+        tp2 = price_now - 3.0 * atrv
+    
+    # Add trigger information
+    trigger_info = []
+    if ema_trigger:
+        trigger_info.append("EMA_CROSS")
+    if rsi_trigger:
+        trigger_info.append("RSI_BURST")
+    
+    return {
+        "side": bias,
+        "zone": zone,
+        "sl": float(sl),
+        "tp1": float(tp1),
+        "tp2": float(tp2),
+        "score": score,
+        "triggers": trigger_info,
+        "bias_source": "DONCHIAN_MID",
+        "dc_mid": float(row["dc_mid"]),
+        "price_vs_mid": f"{((price_now / row['dc_mid'] - 1) * 100):+.2f}%"
+    }
 
 # ---------------- Embeds ----------------
 def embed_trade_open(t: Trade, price_now: float) -> discord.Embed:
@@ -694,7 +893,19 @@ def embed_trade_open(t: Trade, price_now: float) -> discord.Embed:
     e.add_field(name="R:R (TP1/TP2)", value=f"{t.rr1} / {t.rr2}", inline=True)
     e.add_field(name="Current Price", value=f"${price_now:.2f}", inline=True)
     e.add_field(name="Trade ID", value=f"`{t.id}`", inline=True)
-    e.set_footer(text=f"v{VERSION} • {utc_now().strftime('%Y-%m-%d %H:%M:%S')} UTC • Exit alerts enabled")
+    
+    # Show signal details if available in global context
+    try:
+        if hasattr(tm, '_last_signal_info') and tm._last_signal_info:
+            sig = tm._last_signal_info
+            trigger_text = " + ".join(sig.get('triggers', []))
+            e.add_field(name="🎯 Signal", value=f"**{trigger_text}** (Score: {sig.get('score', 0):.1f})", inline=False)
+            dc_info = f"DC Mid: ${sig.get('dc_mid', 0):.2f} ({sig.get('price_vs_mid', 'N/A')})"
+            e.add_field(name="📊 Bias", value=dc_info, inline=True)
+    except:
+        pass
+    
+    e.set_footer(text=f"v{VERSION} • {utc_now().strftime('%Y-%m-%d %H:%M:%S')} UTC • Hybrid Engine")
     return e
 
 def embed_trade_exit(exit_info: dict) -> discord.Embed:
@@ -1064,13 +1275,19 @@ async def scanner():
                     if ch:
                         await ch.send(embed=embed_trade_exit(exit_info))
         
-        # Check for new signals
+        # Check for new signals - UPDATED FOR HYBRID ENGINE
         sig = generate_signal(df, price_now)
         if not sig: return
 
         # cooldown per side simple guard
         if _last_alert_time and (utc_now()-_last_alert_time).total_seconds() < CFG.cooldown_minutes*60:
             return
+
+        # Store signal info for embed - NEW
+        tm._last_signal_info = sig
+        
+        # Enhanced logging with trigger info - NEW
+        log.info(f"🎯 Signal: {sig['side']} | Score: {sig['score']:.1f} | Triggers: {', '.join(sig['triggers'])} | DC Mid: ${sig['dc_mid']:.2f} | Price vs Mid: {sig['price_vs_mid']}")
 
         t = await tm.open_trade(
             side=sig["side"],
@@ -1230,6 +1447,67 @@ async def exits_cmd(ctx):
         embed.add_field(name="Note", value=f"... and {len(tm.active) - 5} more trades", inline=False)
     
     embed.set_footer(text=f"v{VERSION} • Monitoring every 5 seconds")
+    await ctx.reply(embed=embed)
+
+@bot.command(name="signals")
+async def signals_debug(ctx):
+    """Debug current signal conditions"""
+    df = await md.fetch_ohlc(limit=100)
+    if df is None:
+        return await ctx.reply("❌ Cannot fetch data")
+    
+    df = add_indicators(df)
+    current = df.iloc[-1]
+    
+    # Check bias
+    bias = detect_bias(df, len(df)-1)
+    
+    # Check triggers
+    ema_trigger = detect_ema_crossover(df, len(df)-1, bias) if bias else False
+    rsi_trigger = detect_rsi_burst(df, len(df)-1, bias) if bias else False
+    
+    # Score
+    score = score_signal(df, len(df)-1, bias) if bias else 0
+    
+    embed = discord.Embed(title="🔍 Signal Analysis", color=discord.Color.blue())
+    embed.add_field(name="Bias", value=f"{bias or 'NEUTRAL'} (DC Mid: ${current['dc_mid']:.2f})", inline=False)
+    embed.add_field(name="EMA Trigger", value="✅" if ema_trigger else "❌", inline=True)
+    embed.add_field(name="RSI Trigger", value="✅" if rsi_trigger else "❌", inline=True)
+    embed.add_field(name="Score", value=f"{score:.2f} / {CFG.min_score}", inline=True)
+    embed.add_field(name="RSI", value=f"{current['rsi']:.1f}", inline=True)
+    embed.add_field(name="MACD Hist", value=f"{current['macd_hist']:.4f}", inline=True)
+    embed.add_field(name="Vol Ratio", value=f"{current['volume_ratio']:.1f}x", inline=True)
+    
+    await ctx.reply(embed=embed)
+
+@bot.command(name="confluence")
+async def confluence_debug(ctx):
+    """Show confluence factor breakdown"""
+    df = await md.fetch_ohlc(limit=100)
+    if df is None:
+        return await ctx.reply("❌ Cannot fetch data")
+    
+    df = add_indicators(df)
+    
+    # Test both sides
+    long_score = score_signal(df, len(df)-1, "LONG")
+    short_score = score_signal(df, len(df)-1, "SHORT")
+    
+    current = df.iloc[-1]
+    
+    embed = discord.Embed(title="🎯 Confluence Analysis", color=discord.Color.purple())
+    embed.add_field(name="LONG Score", value=f"{long_score:.2f}", inline=True)
+    embed.add_field(name="SHORT Score", value=f"{short_score:.2f}", inline=True)
+    embed.add_field(name="Threshold", value=f"{CFG.min_score}", inline=True)
+    
+    # Individual factors
+    embed.add_field(name="📊 Key Metrics", value=f"""**RSI:** {current['rsi']:.1f}
+**MACD Hist:** {current['macd_hist']:.4f}
+**Stoch RSI:** {current['stoch_rsi_k']:.1f}
+**Volume:** {current['volume_ratio']:.1f}x avg
+**ATR Exp:** {current['atr_expansion']:.2f}x
+**VWAP:** ${current['vwap']:.2f}""", inline=False)
+    
     await ctx.reply(embed=embed)
 
 # ---- Enhanced Commands ----
